@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 embedded-hal = "1.0"
+embedded-hal-bus = "0.3"
 nb = "1"
 cortex-m = "0.7.7"
 cortex-m-rt = "0.7.5"
