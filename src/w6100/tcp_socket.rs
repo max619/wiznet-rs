@@ -113,6 +113,14 @@ impl<'a> TcpSocketState<'a> {
         self.close_requested = true;
     }
 
+    /// Whether the connection has reached a terminal (closed) state.
+    pub(crate) fn is_closed(&self) -> bool {
+        matches!(
+            self.status,
+            SocketStatus::Closed | SocketStatus::Error | SocketStatus::Timeout
+        )
+    }
+
     fn store_error<F: FnMut(&mut Self) -> Result<(), Error>>(
         &mut self,
         mut f: F,
@@ -606,5 +614,19 @@ impl<'a> TcpSocket<'a> {
         }
 
         Ok(())
+    }
+}
+
+impl<'a> Drop for TcpSocket<'a> {
+    /// Releasing the handle hands the hardware socket back to the pool: the
+    /// backend is marked for release so the next `W6100::run` ticks gracefully
+    /// close it on the chip and then return the slot to `Free` for reuse.
+    fn drop(&mut self) {
+        // Single-threaded cooperative use means the cell is not held elsewhere
+        // at drop time; if it somehow is, the slot is reclaimed on the next
+        // `reset` instead.
+        if let Ok(mut guard) = self.backend.lock_mut() {
+            guard.as_mut().request_release();
+        }
     }
 }

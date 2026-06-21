@@ -58,6 +58,10 @@ pub(crate) enum BackendState<'a> {
 pub(crate) struct SocketBackend<'a> {
     block: BlockAddress,
     state: BackendState<'a>,
+
+    /// Set when the owning handle is dropped: the slot is closed on the chip and
+    /// then returned to `Free` so it can be reused.
+    release_requested: bool,
 }
 
 impl<'a> SocketBackend<'a> {
@@ -65,6 +69,7 @@ impl<'a> SocketBackend<'a> {
         Self {
             block,
             state: BackendState::Free,
+            release_requested: false,
         }
     }
 
@@ -79,6 +84,7 @@ impl<'a> SocketBackend<'a> {
         }
 
         self.state = BackendState::Tcp(tcp);
+        self.release_requested = false;
         true
     }
 
@@ -89,21 +95,50 @@ impl<'a> SocketBackend<'a> {
         }
     }
 
-    /// Drive whichever protocol state machine occupies this slot for one tick.
-    pub(crate) fn run<T: Transceiver>(&mut self, trans: &mut T) -> Result<(), Error> {
-        match &mut self.state {
-            BackendState::Free => Ok(()),
-            BackendState::Tcp(tcp) => tcp.run(&self.block, trans),
+    /// Mark the slot for release (handle dropped): gracefully close whatever is
+    /// running so the next `run` ticks can finish teardown and free the slot.
+    pub(crate) fn request_release(&mut self) {
+        self.release_requested = true;
+
+        if let BackendState::Tcp(tcp) = &mut self.state {
+            tcp.request_close();
         }
     }
 
-    /// Force the hardware socket back to CLOSED. The slot itself is kept (any
-    /// outstanding handle stays valid); an occupied slot is re-armed so it
-    /// re-opens on the next `run`.
+    /// Drive whichever protocol state machine occupies this slot for one tick,
+    /// then free the slot if a release was requested and teardown has finished.
+    pub(crate) fn run<T: Transceiver>(&mut self, trans: &mut T) -> Result<(), Error> {
+        let result = match &mut self.state {
+            BackendState::Free => Ok(()),
+            BackendState::Tcp(tcp) => tcp.run(&self.block, trans),
+        };
+
+        if self.release_requested && self.is_terminal() {
+            self.state = BackendState::Free;
+            self.release_requested = false;
+        }
+
+        result
+    }
+
+    /// Whether the occupying protocol state machine has reached a closed state.
+    fn is_terminal(&self) -> bool {
+        match &self.state {
+            BackendState::Free => true,
+            BackendState::Tcp(tcp) => tcp.is_closed(),
+        }
+    }
+
+    /// Force the hardware socket back to CLOSED. A slot pending release is freed
+    /// immediately (it is already closed on the chip); otherwise an occupied
+    /// slot is re-armed so it re-opens on the next `run`.
     pub(crate) fn reset<T: Transceiver>(&mut self, trans: &mut T) -> Result<(), Error> {
         init_socket(&self.block, trans, SocketProtocolMode::CLOSED)?;
 
-        if let BackendState::Tcp(tcp) = &mut self.state {
+        if self.release_requested {
+            self.state = BackendState::Free;
+            self.release_requested = false;
+        } else if let BackendState::Tcp(tcp) = &mut self.state {
             tcp.rearm();
         }
 
