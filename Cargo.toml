@@ -16,3 +16,15 @@ bitflags = "2.4"
 [dependencies.stm32f1xx-hal]
 version = "0.11.0"
 features = ["stm32f103"]
+
+# Your own crate: unoptimized, full debug info — fully debuggable.
+[profile.dev]
+opt-level = 1
+debug = true
+
+# All dependencies: optimize for size and drop their debug info. This is what
+# shrinks the build; you rarely step through HAL/cortex-m anyway. `"*"` matches
+# every dependency but NOT your own package.
+[profile.dev.package."*"]
+opt-level = "z"
+debug = false
