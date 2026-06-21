@@ -177,11 +177,12 @@ impl<Spi: SpiDevice<u8>> Transceiver for Transport<Spi> {
         let mut buf = [0u8; 3];
 
         buf[0..2].copy_from_slice(&addr.address.to_be_bytes());
-        buf[2] = (addr.block as u8) << 3 | 2;
+        // RWB (bit 2) = 1 selects write; OM (bits 1:0) = 00 = VDM.
+        buf[2] = (addr.block as u8) << 3 | 0b100;
 
         self.spi
             .transaction(&mut [Operation::Write(&buf), Operation::Write(data)])
-            .map_err(|e| Error::SpiError)
+            .map_err(|_| Error::SpiError)
     }
 }
 
