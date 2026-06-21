@@ -66,14 +66,9 @@ fn main() -> ! {
     )
     .expect("Failed to init W6100");
 
+    // Echo server: listen on TCP port 5555 and bounce back whatever arrives.
     let sock = chip
-        .open_tcp_connect(
-            u32::from_be_bytes([192, 168, 10, 148]),
-            5555,
-            50000,
-            &mut rx,
-            &mut tx,
-        )
+        .open_tcp_listen(5555, &mut rx, &mut tx)
         .expect("Failed to open socket");
 
     loop {
@@ -87,7 +82,7 @@ fn main() -> ! {
         )
         .unwrap();
 
-        // Re-arm the socket so `run` re-opens and reconnects it.
+        // Re-arm the socket so `run` re-opens it and starts listening.
         sock.reconnect().unwrap();
 
         loop {
@@ -98,11 +93,21 @@ fn main() -> ! {
 
             chip.run().unwrap();
 
-            if sock.status().unwrap() == SocketStatus::Established {
-                let mut recv_buff = [0u8; 16];
+            match sock.status().unwrap() {
+                SocketStatus::Established => {
+                    let mut recv_buff = [0u8; 16];
 
-                let read_bytes = sock.read(&mut recv_buff).unwrap();
-                sock.write(&recv_buff[0..read_bytes]).unwrap();
+                    let read_bytes = sock.read(&mut recv_buff).unwrap();
+                    sock.write(&recv_buff[0..read_bytes]).unwrap();
+                }
+
+                // Client disconnected (or the attempt failed); re-arm to accept
+                // the next connection.
+                SocketStatus::Closed | SocketStatus::Timeout | SocketStatus::Error => {
+                    sock.reconnect().unwrap();
+                }
+
+                _ => {}
             }
         }
     }

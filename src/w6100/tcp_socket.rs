@@ -229,6 +229,49 @@ impl<'a> TcpSocketState<'a> {
         }
     }
 
+    /// Passively waiting on a `LISTEN`ing socket for a client to connect. Once
+    /// the handshake completes the socket is `SOCK_ESTABLISHED` and is handed
+    /// off to the same established machinery as an outbound connection.
+    fn handle_listening<T: Transceiver>(
+        &mut self,
+        block: &BlockAddress,
+        trans: &mut T,
+    ) -> Result<(), Error> {
+        if is_command_pending(block, trans)? {
+            return Ok(());
+        }
+
+        match read_status(block, trans)? {
+            // Still waiting for a client, or the SYN handshake is in progress.
+            SocketStatusRegister::Listen | SocketStatusRegister::Synrecv => Ok(()),
+
+            // A client connected. (Treat an immediate FIN the same — let the
+            // established handler drain and tear it down next tick.)
+            SocketStatusRegister::Established | SocketStatusRegister::CloseWait => {
+                self.status = SocketStatus::Established;
+                clear_interrupts(block, trans, SocketInterrupt::CON)?;
+
+                Ok(())
+            }
+
+            // A half-open attempt was reset/timed out and the chip closed the
+            // socket; re-arm to listen again.
+            SocketStatusRegister::Closed => {
+                clear_interrupts(block, trans, SocketInterrupt::TIMEOUT)?;
+                self.status = SocketStatus::Closed;
+
+                Ok(())
+            }
+
+            _ => {
+                send_sock_command(block, trans, SocketCommand::Close)?;
+                self.status = SocketStatus::ClosingDueToError;
+
+                Err(Error::UnexpectedResponse)
+            }
+        }
+    }
+
     /// Move any data waiting in the chip's RX buffer into the local rx ring,
     /// limited by the room available there. Anything that doesn't fit is left
     /// on the chip and picked up on a later tick. Non-blocking.
@@ -421,7 +464,7 @@ impl<'a> TcpSocketState<'a> {
             SocketStatus::Opening => me.handle_opening(block, trans),
             SocketStatus::Connecting => me.handle_connecting(block, trans),
             SocketStatus::Established => me.handle_established(block, trans),
-            SocketStatus::Listening => todo!(),
+            SocketStatus::Listening => me.handle_listening(block, trans),
             SocketStatus::ClosingDueToError
             | SocketStatus::ClosingDueToTimeout
             | SocketStatus::Closing => me.handle_closing(block, trans),
