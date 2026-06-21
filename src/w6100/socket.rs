@@ -1,10 +1,9 @@
-use core::{marker::PhantomData, pin::Pin, sync::atomic::AtomicBool};
-
 use bitflags::bitflags;
 
 use crate::w6100::{
     Error,
-    atomic_cell::{AtomicCellGuard, AtomicLock, AtomicMutLock, AtomicRefCell, MutAtomicCellGuard},
+    socket_common::init_socket,
+    tcp_socket::TcpSocketState,
     transiver::{BlockAddress, Transceiver},
 };
 
@@ -44,55 +43,70 @@ pub enum SocketStatus {
     Closed,
 }
 
-pub trait UserSocket<Trans: Transceiver> {
-    fn get_status(&self) -> SocketStatus;
+/// The protocol-specific state machine living inside a [`SocketBackend`] slot.
+///
+/// Adding a new protocol is a matter of introducing a `*SocketState` module and
+/// a variant here; [`SocketBackend::run`] (and the chip driver above it) keep
+/// the same shape.
+pub(crate) enum BackendState<'a> {
+    Free,
+    Tcp(TcpSocketState<'a>),
 }
 
-pub(crate) trait SocketInternal<'a, Trans: Transceiver>: UserSocket<Trans> {
-    fn init(&mut self, block: &BlockAddress, trans: &mut Trans) -> Result<(), Error>;
-
-    fn run(&mut self, block: &BlockAddress, trans: &mut Trans) -> Result<(), Error>;
+/// One of the chip's eight hardware sockets. Owned by the `W6100`; user-facing
+/// handles only hold an atomic reference to the enclosing cell.
+pub(crate) struct SocketBackend<'a> {
+    block: BlockAddress,
+    state: BackendState<'a>,
 }
 
-pub(crate) trait SocketAccess<'a, Trans: Transceiver> {
-    fn lock_inner(
-        &self,
-    ) -> Result<MutAtomicCellGuard<'_, dyn SocketInternal<'a, Trans> + 'a>, Error>;
-}
-
-pub struct PinnedSocket<'a, Trans: Transceiver, Sock: SocketInternal<'a, Trans>> {
-    inner: AtomicRefCell<&'a mut Sock>,
-
-    _ph: PhantomData<Trans>,
-}
-
-impl<'a, Trans: Transceiver, Sock: SocketInternal<'a, Trans>> PinnedSocket<'a, Trans, Sock> {
-    pub fn pin(inner: &'a mut Sock) -> Self {
+impl<'a> SocketBackend<'a> {
+    pub(crate) fn new(block: BlockAddress) -> Self {
         Self {
-            inner: AtomicRefCell::new(inner),
-            _ph: PhantomData::<Trans>,
+            block,
+            state: BackendState::Free,
         }
     }
 
-    pub fn lock(&self) -> Result<AtomicCellGuard<'_, Sock>, Error> {
-        let res = self.inner.lock()?;
-        Ok(res)
+    pub(crate) fn is_free(&self) -> bool {
+        matches!(self.state, BackendState::Free)
     }
 
-    pub fn lock_mut(&self) -> Result<MutAtomicCellGuard<'_, Sock>, Error> {
-        let res = self.inner.lock_mut()?;
-        Ok(res)
-    }
-}
+    /// Claim a free slot for a TCP socket. Returns `false` if already in use.
+    pub(crate) fn claim_tcp(&mut self, tcp: TcpSocketState<'a>) -> bool {
+        if !self.is_free() {
+            return false;
+        }
 
-impl<'a, Trans: Transceiver, Sock: SocketInternal<'a, Trans>> SocketAccess<'a, Trans>
-    for PinnedSocket<'a, Trans, Sock>
-{
-    fn lock_inner(
-        &self,
-    ) -> Result<MutAtomicCellGuard<'_, dyn SocketInternal<'a, Trans> + 'a>, Error> {
-        Ok(self
-            .lock_mut()?
-            .map(|s| s as &mut (dyn SocketInternal<'a, Trans> + 'a)))
+        self.state = BackendState::Tcp(tcp);
+        true
+    }
+
+    pub(crate) fn as_tcp_mut(&mut self) -> Option<&mut TcpSocketState<'a>> {
+        match &mut self.state {
+            BackendState::Tcp(tcp) => Some(tcp),
+            _ => None,
+        }
+    }
+
+    /// Drive whichever protocol state machine occupies this slot for one tick.
+    pub(crate) fn run<T: Transceiver>(&mut self, trans: &mut T) -> Result<(), Error> {
+        match &mut self.state {
+            BackendState::Free => Ok(()),
+            BackendState::Tcp(tcp) => tcp.run(&self.block, trans),
+        }
+    }
+
+    /// Force the hardware socket back to CLOSED. The slot itself is kept (any
+    /// outstanding handle stays valid); an occupied slot is re-armed so it
+    /// re-opens on the next `run`.
+    pub(crate) fn reset<T: Transceiver>(&mut self, trans: &mut T) -> Result<(), Error> {
+        init_socket(&self.block, trans, SocketProtocolMode::CLOSED)?;
+
+        if let BackendState::Tcp(tcp) = &mut self.state {
+            tcp.rearm();
+        }
+
+        Ok(())
     }
 }

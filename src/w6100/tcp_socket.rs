@@ -1,9 +1,8 @@
-use core::marker::PhantomData;
-
 use crate::w6100::{
     Error,
-    socket::{SocketInternal, SocketProtocolMode, SocketStatus, UserSocket},
+    atomic_cell::{AtomicCell, AtomicMutLock},
     ring_buffer::RingBuffer,
+    socket::{SocketBackend, SocketProtocolMode, SocketStatus},
     socket_common::{
         SocketCommand, SocketInterrupt, SocketStatusRegister, clear_interrupts, get_interrupts,
         get_rx_read_pointer, get_rx_received_size, get_tx_free_size, get_tx_write_pointer,
@@ -12,7 +11,7 @@ use crate::w6100::{
         write_tx_buffer,
     },
     tcp_socket::TcpMode::{Connect, Listen},
-    transiver::{Address, BlockAddress, Transceiver},
+    transiver::{BlockAddress, Transceiver},
 };
 
 enum TcpMode {
@@ -26,7 +25,11 @@ enum TcpMode {
     },
 }
 
-pub struct TcpSocket<'a, Trans: Transceiver> {
+/// The TCP protocol state machine and its buffers. Lives inside a
+/// [`SocketBackend`] slot owned by the `W6100`; it is driven by `run` (which
+/// has chip access) and read/written through a [`TcpSocket`] handle (which does
+/// not — it only touches the local rings).
+pub(crate) struct TcpSocketState<'a> {
     mode: TcpMode,
     status: SocketStatus,
 
@@ -34,12 +37,10 @@ pub struct TcpSocket<'a, Trans: Transceiver> {
     tx_buffer: RingBuffer<'a>,
 
     pending_error: Option<Error>,
-
-    _ph: PhantomData<Trans>,
 }
 
-impl<'a, Trans: Transceiver> TcpSocket<'a, Trans> {
-    pub fn connect(
+impl<'a> TcpSocketState<'a> {
+    pub(crate) fn connect(
         addr: u32,
         port: u16,
         src_port: u16,
@@ -58,12 +59,10 @@ impl<'a, Trans: Transceiver> TcpSocket<'a, Trans> {
             tx_buffer: RingBuffer::new(tx_buffer),
 
             pending_error: None,
-
-            _ph: PhantomData::<Trans>,
         }
     }
 
-    pub fn listen(port: u16, rx_buffer: &'a mut [u8], tx_buffer: &'a mut [u8]) -> Self {
+    pub(crate) fn listen(port: u16, rx_buffer: &'a mut [u8], tx_buffer: &'a mut [u8]) -> Self {
         Self {
             mode: Listen { src_port: port },
             status: SocketStatus::Init,
@@ -72,37 +71,32 @@ impl<'a, Trans: Transceiver> TcpSocket<'a, Trans> {
             tx_buffer: RingBuffer::new(tx_buffer),
 
             pending_error: None,
-
-            _ph: PhantomData::<Trans>,
         }
     }
 
-    /// Drain up to `dst.len()` bytes that have been received and buffered
-    /// locally. Returns the number of bytes copied (0 if nothing is buffered).
-    /// Non-blocking: it only reads what [`run`](SocketInternal::run) has already
-    /// pulled off the chip.
-    pub fn read(&mut self, dst: &mut [u8]) -> usize {
+    /// Drain up to `dst.len()` already-received bytes from the local rx ring.
+    pub(crate) fn read(&mut self, dst: &mut [u8]) -> usize {
         self.rx_buffer.read(dst)
     }
 
-    /// Queue up to `src.len()` bytes for transmission, returning the number
-    /// accepted into the local tx ring (limited by its free space). Non-blocking:
-    /// the staged data is pushed onto the chip and sent by
-    /// [`run`](SocketInternal::run).
-    pub fn write(&mut self, src: &[u8]) -> usize {
+    /// Stage up to `src.len()` bytes into the local tx ring for transmission.
+    pub(crate) fn write(&mut self, src: &[u8]) -> usize {
         self.tx_buffer.write(src)
     }
 
-    fn raise_pending_error(&mut self) -> Result<(), Error> {
-        match self.pending_error {
-            Some(e) => {
-                let err = e;
-                self.pending_error = None;
-
-                Err(err)
-            }
-            None => Ok(()),
+    pub(crate) fn status(&self) -> SocketStatus {
+        if self.pending_error.is_some() {
+            SocketStatus::Error
+        } else {
+            self.status
         }
+    }
+
+    /// Re-arm the socket so the next `run` re-opens it on the chip. Used after a
+    /// link-loss reset to reconnect without dropping the handle or buffers.
+    pub(crate) fn rearm(&mut self) {
+        self.status = SocketStatus::Init;
+        self.pending_error = None;
     }
 
     fn store_error<F: FnMut(&mut Self) -> Result<(), Error>>(
@@ -121,9 +115,35 @@ impl<'a, Trans: Transceiver> TcpSocket<'a, Trans> {
         }
     }
 
+    /// Configure the hardware socket and issue `OPEN`. This is the first tick of
+    /// a freshly opened (or re-armed) socket; the source port must be set before
+    /// `OPEN`, and `CONNECT`/`LISTEN` are only valid once it reaches `SOCK_INIT`.
+    fn handle_init<T: Transceiver>(
+        &mut self,
+        block: &BlockAddress,
+        trans: &mut T,
+    ) -> Result<(), Error> {
+        init_socket(block, trans, SocketProtocolMode::TCP4)?;
+
+        let src_port = match &self.mode {
+            TcpMode::Connect { src_port, .. } => *src_port,
+            TcpMode::Listen { src_port } => *src_port,
+        };
+        set_src_port(block, trans, src_port)?;
+
+        send_sock_command(block, trans, SocketCommand::Open)?;
+        self.status = SocketStatus::Opening;
+
+        Ok(())
+    }
+
     /// Waiting for the `OPEN` command to move the socket into `SOCK_INIT`,
     /// then issuing the protocol-specific command (`CONNECT`/`LISTEN`).
-    fn handle_opening(&mut self, block: &BlockAddress, trans: &mut Trans) -> Result<(), Error> {
+    fn handle_opening<T: Transceiver>(
+        &mut self,
+        block: &BlockAddress,
+        trans: &mut T,
+    ) -> Result<(), Error> {
         // `OPEN` not processed yet.
         if is_command_pending(block, trans)? {
             return Ok(());
@@ -162,7 +182,11 @@ impl<'a, Trans: Transceiver> TcpSocket<'a, Trans> {
         }
     }
 
-    fn handle_connecting(&mut self, block: &BlockAddress, trans: &mut Trans) -> Result<(), Error> {
+    fn handle_connecting<T: Transceiver>(
+        &mut self,
+        block: &BlockAddress,
+        trans: &mut T,
+    ) -> Result<(), Error> {
         if is_command_pending(block, trans)? {
             return Ok(());
         }
@@ -212,7 +236,11 @@ impl<'a, Trans: Transceiver> TcpSocket<'a, Trans> {
     /// Returns the number of bytes still sitting in the chip's RX buffer after
     /// this pass (non-zero only when the local ring filled up). A return of `0`
     /// means the chip buffer is fully drained.
-    fn receive(&mut self, block: &BlockAddress, trans: &mut Trans) -> Result<usize, Error> {
+    fn receive<T: Transceiver>(
+        &mut self,
+        block: &BlockAddress,
+        trans: &mut T,
+    ) -> Result<usize, Error> {
         let available = get_rx_received_size(block, trans)? as usize;
         if available == 0 {
             return Ok(0);
@@ -255,7 +283,11 @@ impl<'a, Trans: Transceiver> TcpSocket<'a, Trans> {
     /// Returns the number of bytes still queued in the local tx ring after this
     /// pass (non-zero only when the chip's TX buffer filled up). A return of `0`
     /// means everything staged has been handed to the chip.
-    fn transmit(&mut self, block: &BlockAddress, trans: &mut Trans) -> Result<usize, Error> {
+    fn transmit<T: Transceiver>(
+        &mut self,
+        block: &BlockAddress,
+        trans: &mut T,
+    ) -> Result<usize, Error> {
         let pending = self.tx_buffer.len();
         if pending == 0 {
             return Ok(0);
@@ -294,7 +326,11 @@ impl<'a, Trans: Transceiver> TcpSocket<'a, Trans> {
     /// Idle health-check for an established connection: watch for the failure
     /// and teardown conditions that can occur while we are not actively
     /// sending or receiving.
-    fn handle_established(&mut self, block: &BlockAddress, trans: &mut Trans) -> Result<(), Error> {
+    fn handle_established<T: Transceiver>(
+        &mut self,
+        block: &BlockAddress,
+        trans: &mut T,
+    ) -> Result<(), Error> {
         let interrupts = get_interrupts(block, trans)?;
 
         // Retransmission / keep-alive timeout: the peer is unreachable, so the
@@ -357,7 +393,11 @@ impl<'a, Trans: Transceiver> TcpSocket<'a, Trans> {
         }
     }
 
-    fn handle_closing(&mut self, block: &BlockAddress, trans: &mut Trans) -> Result<(), Error> {
+    fn handle_closing<T: Transceiver>(
+        &mut self,
+        block: &BlockAddress,
+        trans: &mut T,
+    ) -> Result<(), Error> {
         if read_status(block, trans)? == SocketStatusRegister::Closed {
             self.status = match &self.status {
                 SocketStatus::ClosingDueToError => SocketStatus::Error,
@@ -369,40 +409,15 @@ impl<'a, Trans: Transceiver> TcpSocket<'a, Trans> {
 
         Ok(())
     }
-}
 
-impl<'a, Trans: Transceiver> UserSocket<Trans> for TcpSocket<'a, Trans> {
-    fn get_status(&self) -> SocketStatus {
-        if self.pending_error.is_some() {
-            SocketStatus::Error
-        } else {
-            self.status
-        }
-    }
-}
-
-impl<'a, Trans: Transceiver> SocketInternal<'a, Trans> for TcpSocket<'a, Trans> {
-    fn init(&mut self, block: &BlockAddress, trans: &mut Trans) -> Result<(), Error> {
-        self.store_error(|me| {
-            init_socket(block, trans, SocketProtocolMode::TCP4)?;
-
-            // The source port must be set before OPEN; CONNECT/LISTEN are only
-            // valid once the socket has reached SOCK_INIT.
-            let src_port = match &me.mode {
-                TcpMode::Connect { src_port, .. } => *src_port,
-                TcpMode::Listen { src_port } => *src_port,
-            };
-            set_src_port(block, trans, src_port)?;
-
-            send_sock_command(block, trans, SocketCommand::Open)?;
-            me.status = SocketStatus::Opening;
-
-            Ok(())
-        })
-    }
-
-    fn run(&mut self, block: &BlockAddress, trans: &mut Trans) -> Result<(), Error> {
-        self.store_error(|me| match &me.status {
+    /// Advance the state machine by one non-blocking tick.
+    pub(crate) fn run<T: Transceiver>(
+        &mut self,
+        block: &BlockAddress,
+        trans: &mut T,
+    ) -> Result<(), Error> {
+        self.store_error(|me| match me.status {
+            SocketStatus::Init => me.handle_init(block, trans),
             SocketStatus::Opening => me.handle_opening(block, trans),
             SocketStatus::Connecting => me.handle_connecting(block, trans),
             SocketStatus::Established => me.handle_established(block, trans),
@@ -411,10 +426,64 @@ impl<'a, Trans: Transceiver> SocketInternal<'a, Trans> for TcpSocket<'a, Trans> 
             | SocketStatus::ClosingDueToTimeout
             | SocketStatus::Closing => me.handle_closing(block, trans),
 
-            SocketStatus::Timeout
-            | SocketStatus::Closed
-            | SocketStatus::Init
-            | SocketStatus::Error => Ok(()),
+            SocketStatus::Timeout | SocketStatus::Closed | SocketStatus::Error => Ok(()),
         })
+    }
+}
+
+/// A lightweight, user-facing handle to a TCP socket. Holds only an atomic
+/// reference to the backend slot owned by the `W6100`; all chip I/O happens in
+/// `W6100::run`, so the handle's operations touch only the local ring buffers.
+pub struct TcpSocket<'a> {
+    backend: &'a AtomicCell<SocketBackend<'a>>,
+}
+
+impl<'a> TcpSocket<'a> {
+    pub(crate) fn new(backend: &'a AtomicCell<SocketBackend<'a>>) -> Self {
+        Self { backend }
+    }
+
+    /// Drain up to `dst.len()` bytes already received and buffered locally.
+    /// Returns the number copied (0 if nothing is buffered). Non-blocking.
+    pub fn read(&self, dst: &mut [u8]) -> Result<usize, Error> {
+        let mut guard = self.backend.lock_mut()?;
+
+        Ok(match guard.as_mut().as_tcp_mut() {
+            Some(tcp) => tcp.read(dst),
+            None => 0,
+        })
+    }
+
+    /// Queue up to `src.len()` bytes for transmission, returning the number
+    /// accepted into the local tx ring. Non-blocking: the staged data is pushed
+    /// onto the chip and sent by `W6100::run`.
+    pub fn write(&self, src: &[u8]) -> Result<usize, Error> {
+        let mut guard = self.backend.lock_mut()?;
+
+        Ok(match guard.as_mut().as_tcp_mut() {
+            Some(tcp) => tcp.write(src),
+            None => 0,
+        })
+    }
+
+    pub fn status(&self) -> Result<SocketStatus, Error> {
+        let mut guard = self.backend.lock_mut()?;
+
+        Ok(match guard.as_mut().as_tcp_mut() {
+            Some(tcp) => tcp.status(),
+            None => SocketStatus::Closed,
+        })
+    }
+
+    /// Re-arm the socket so `W6100::run` re-opens and reconnects it. Use after a
+    /// link-loss `reset` to bring the connection back up.
+    pub fn reconnect(&self) -> Result<(), Error> {
+        let mut guard = self.backend.lock_mut()?;
+
+        if let Some(tcp) = guard.as_mut().as_tcp_mut() {
+            tcp.rearm();
+        }
+
+        Ok(())
     }
 }

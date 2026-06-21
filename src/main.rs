@@ -14,7 +14,7 @@ use stm32f1xx_hal::{
 };
 
 mod w6100;
-use crate::w6100::{PinnedSocket, SocketStatus, TcpSocket, UserSocket, W6100};
+use crate::w6100::{SocketStatus, W6100};
 
 #[entry]
 fn main() -> ! {
@@ -50,7 +50,11 @@ fn main() -> ! {
 
     let mac = [0xfc, 0xd7, 0xfd, 0xab, 0x8b, 0xe4];
 
-    let mut chip = W6100::new(
+    // Declared before the chip so they outlive the handle's borrow of it.
+    let mut rx = [0u8; 512];
+    let mut tx = [0u8; 512];
+
+    let chip = W6100::new(
         embedded_hal_bus::spi::ExclusiveDevice::new(
             spi,
             cs,
@@ -62,19 +66,16 @@ fn main() -> ! {
     )
     .expect("Failed to init W6100");
 
-    let mut rx = [0u8; 512];
-    let mut tx = [0u8; 512];
+    let sock = chip
+        .open_tcp_connect(
+            u32::from_be_bytes([192, 168, 10, 148]),
+            5555,
+            50000,
+            &mut rx,
+            &mut tx,
+        )
+        .expect("Failed to open socket");
 
-    let mut sock = TcpSocket::connect(
-        u32::from_be_bytes([192, 168, 10, 148]),
-        5555,
-        50000,
-        &mut rx,
-        &mut tx,
-    );
-    let pinned_sock = PinnedSocket::pin(&mut sock);
-
-    // Wait for the timer to trigger an update and change the state of the LED
     loop {
         // Wait for link
         while !chip.is_link_up().unwrap() {}
@@ -86,7 +87,8 @@ fn main() -> ! {
         )
         .unwrap();
 
-        chip.open(&pinned_sock).unwrap();
+        // Re-arm the socket so `run` re-opens and reconnects it.
+        sock.reconnect().unwrap();
 
         loop {
             if !chip.is_link_up().unwrap() {
@@ -96,16 +98,12 @@ fn main() -> ! {
 
             chip.run().unwrap();
 
-            let mut recv_buff = [0u8; 16];
+            if sock.status().unwrap() == SocketStatus::Established {
+                let mut recv_buff = [0u8; 16];
 
-            {
-                let mut locked_sock = pinned_sock.lock_mut().unwrap();
-
-                if locked_sock.as_mut().get_status() == SocketStatus::Established {
-                    let read_bytes = locked_sock.as_mut().read(&mut recv_buff);
-                    locked_sock.as_mut().write(&recv_buff[0..read_bytes]);
-                }
-            };
+                let read_bytes = sock.read(&mut recv_buff).unwrap();
+                sock.write(&recv_buff[0..read_bytes]).unwrap();
+            }
         }
     }
 }

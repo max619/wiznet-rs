@@ -1,5 +1,3 @@
-use core::marker::PhantomData;
-
 use bitflags::bitflags;
 use embedded_hal::{
     digital::OutputPin,
@@ -7,20 +5,14 @@ use embedded_hal::{
 };
 
 mod atomic_cell;
-
-use crate::w6100::{
-    socket::{SocketAccess, SocketInternal, SocketProtocolMode},
-    socket_common::init_socket,
-    transiver::BlockAddress,
-};
-
-use self::atomic_cell::{AtomicCell, AtomicError};
+use self::atomic_cell::{AtomicCell, AtomicError, AtomicMutLock};
 
 mod transiver;
-use self::transiver::{Address, BlockSelectionBits, Transceiver};
+use self::transiver::{Address, BlockAddress, BlockSelectionBits, Transceiver};
 
 mod socket;
-pub use socket::{PinnedSocket, SocketStatus, UserSocket};
+pub use self::socket::SocketStatus;
+use self::socket::SocketBackend;
 
 mod socket_common;
 
@@ -28,6 +20,7 @@ mod ring_buffer;
 
 mod tcp_socket;
 pub use self::tcp_socket::TcpSocket;
+use self::tcp_socket::TcpSocketState;
 
 const CIDR: Address = Address {
     address: 0x0,
@@ -129,22 +122,23 @@ bitflags! {
 
 pub type MacAddress = [u8; 6];
 
-struct SocketBackend<'a, Trans: Transceiver> {
-    block: BlockAddress,
-
-    accessor: Option<&'a dyn SocketAccess<'a, Trans>>,
-}
-
 pub struct Transport<Spi: SpiDevice<u8>> {
     spi: Spi,
 }
 
-pub struct W6100<'a, Spi: SpiDevice<u8>, RstPin: OutputPin> {
+/// The chip's shared hardware: the SPI transport and the reset pin. Kept behind
+/// an `AtomicCell` so the user-facing socket handles (which borrow the `W6100`)
+/// can coexist with `&self` driver methods that need exclusive hardware access.
+struct Device<Spi: SpiDevice<u8>, RstPin: OutputPin> {
     transport: Transport<Spi>,
     rst: RstPin,
+}
+
+pub struct W6100<'a, Spi: SpiDevice<u8>, RstPin: OutputPin> {
+    device: AtomicCell<Device<Spi, RstPin>>,
     mac: MacAddress,
 
-    sockets: [SocketBackend<'a, Transport<Spi>>; 8],
+    sockets: [AtomicCell<SocketBackend<'a>>; 8],
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -188,78 +182,64 @@ impl<Spi: SpiDevice<u8>> Transceiver for Transport<Spi> {
     }
 }
 
+/// Build one socket backend cell for the given register/buffer block selectors.
+fn backend_cell<'a>(
+    reg: BlockSelectionBits,
+    tx: BlockSelectionBits,
+    rx: BlockSelectionBits,
+) -> AtomicCell<SocketBackend<'a>> {
+    AtomicCell::new(SocketBackend::new(BlockAddress { reg, tx, rx }))
+}
+
 impl<'a, Spi: SpiDevice<u8>, RstPin: OutputPin> W6100<'a, Spi, RstPin> {
     pub fn new(spi: Spi, rst: RstPin, mac: MacAddress) -> Result<Self, Error> {
-        let mut this = W6100 {
-            transport: Transport { spi },
-            rst,
+        let this = W6100 {
+            device: AtomicCell::new(Device {
+                transport: Transport { spi },
+                rst,
+            }),
             mac,
             sockets: [
-                SocketBackend {
-                    block: BlockAddress {
-                        reg: BlockSelectionBits::Socket0Register,
-                        tx: BlockSelectionBits::Socket0TxBuffer,
-                        rx: BlockSelectionBits::Socket0RxBuffer,
-                    },
-                    accessor: None,
-                },
-                SocketBackend {
-                    block: BlockAddress {
-                        reg: BlockSelectionBits::Socket1Register,
-                        tx: BlockSelectionBits::Socket1TxBuffer,
-                        rx: BlockSelectionBits::Socket1RxBuffer,
-                    },
-
-                    accessor: None,
-                },
-                SocketBackend {
-                    block: BlockAddress {
-                        reg: BlockSelectionBits::Socket2Register,
-                        tx: BlockSelectionBits::Socket2TxBuffer,
-                        rx: BlockSelectionBits::Socket2RxBuffer,
-                    },
-                    accessor: None,
-                },
-                SocketBackend {
-                    block: BlockAddress {
-                        reg: BlockSelectionBits::Socket3Register,
-                        tx: BlockSelectionBits::Socket3TxBuffer,
-                        rx: BlockSelectionBits::Socket3RxBuffer,
-                    },
-                    accessor: None,
-                },
-                SocketBackend {
-                    block: BlockAddress {
-                        reg: BlockSelectionBits::Socket4Register,
-                        tx: BlockSelectionBits::Socket4TxBuffer,
-                        rx: BlockSelectionBits::Socket4RxBuffer,
-                    },
-                    accessor: None,
-                },
-                SocketBackend {
-                    block: BlockAddress {
-                        reg: BlockSelectionBits::Socket5Register,
-                        tx: BlockSelectionBits::Socket5TxBuffer,
-                        rx: BlockSelectionBits::Socket5RxBuffer,
-                    },
-                    accessor: None,
-                },
-                SocketBackend {
-                    block: BlockAddress {
-                        reg: BlockSelectionBits::Socket6Register,
-                        tx: BlockSelectionBits::Socket6TxBuffer,
-                        rx: BlockSelectionBits::Socket6RxBuffer,
-                    },
-                    accessor: None,
-                },
-                SocketBackend {
-                    block: BlockAddress {
-                        reg: BlockSelectionBits::Socket7Register,
-                        tx: BlockSelectionBits::Socket7TxBuffer,
-                        rx: BlockSelectionBits::Socket7RxBuffer,
-                    },
-                    accessor: None,
-                },
+                backend_cell(
+                    BlockSelectionBits::Socket0Register,
+                    BlockSelectionBits::Socket0TxBuffer,
+                    BlockSelectionBits::Socket0RxBuffer,
+                ),
+                backend_cell(
+                    BlockSelectionBits::Socket1Register,
+                    BlockSelectionBits::Socket1TxBuffer,
+                    BlockSelectionBits::Socket1RxBuffer,
+                ),
+                backend_cell(
+                    BlockSelectionBits::Socket2Register,
+                    BlockSelectionBits::Socket2TxBuffer,
+                    BlockSelectionBits::Socket2RxBuffer,
+                ),
+                backend_cell(
+                    BlockSelectionBits::Socket3Register,
+                    BlockSelectionBits::Socket3TxBuffer,
+                    BlockSelectionBits::Socket3RxBuffer,
+                ),
+                backend_cell(
+                    BlockSelectionBits::Socket4Register,
+                    BlockSelectionBits::Socket4TxBuffer,
+                    BlockSelectionBits::Socket4RxBuffer,
+                ),
+                backend_cell(
+                    BlockSelectionBits::Socket5Register,
+                    BlockSelectionBits::Socket5TxBuffer,
+                    BlockSelectionBits::Socket5RxBuffer,
+                ),
+                backend_cell(
+                    BlockSelectionBits::Socket6Register,
+                    BlockSelectionBits::Socket6TxBuffer,
+                    BlockSelectionBits::Socket6RxBuffer,
+                ),
+                backend_cell(
+                    BlockSelectionBits::Socket7Register,
+                    BlockSelectionBits::Socket7TxBuffer,
+                    BlockSelectionBits::Socket7RxBuffer,
+                ),
             ],
         };
 
@@ -267,130 +247,148 @@ impl<'a, Spi: SpiDevice<u8>, RstPin: OutputPin> W6100<'a, Spi, RstPin> {
         Ok(this)
     }
 
-    pub fn reset(&mut self) -> Result<(), Error> {
-        self.rst.set_low().map_err(|_| Error::PinError)?;
+    pub fn reset(&self) -> Result<(), Error> {
+        let mut dev_guard = self.device.lock_mut()?;
+        let device = dev_guard.as_mut();
 
-        self.transport
+        device.rst.set_low().map_err(|_| Error::PinError)?;
+
+        device
+            .transport
             .spi
             .transaction(&mut [Operation::DelayNs(1_000_000)])
             .map_err(|_| Error::SpiError)?;
 
-        self.rst.set_high().map_err(|_| Error::PinError)?;
+        device.rst.set_high().map_err(|_| Error::PinError)?;
 
-        if self.transport.read_u16(&CIDR)? != 0x6100 {
+        if device.transport.read_u16(&CIDR)? != 0x6100 {
             return Err(Error::UnexpectedResponse);
         }
 
-        if self.transport.read_u16(&VER)? != 0x4661 {
+        if device.transport.read_u16(&VER)? != 0x4661 {
             return Err(Error::UnexpectedResponse);
         }
 
-        for sock in self.sockets.iter_mut().by_ref() {
-            sock.reset(&mut self.transport)?;
+        for cell in self.sockets.iter() {
+            cell.lock_mut()?.as_mut().reset(&mut device.transport)?;
         }
 
         // Unlock SYSR registers
-        self.transport.write_u8(&CHPLCKR, 0xCE)?;
+        device.transport.write_u8(&CHPLCKR, 0xCE)?;
         // Enable interrupts, clock-select 100Mhz
-        self.transport.write_u8(&SYCR1, 0b10000000)?;
+        device.transport.write_u8(&SYCR1, 0b10000000)?;
         // Lock SYSR registers
-        self.transport.write_u8(&CHPLCKR, 0x00)?;
+        device.transport.write_u8(&CHPLCKR, 0x00)?;
 
         Ok(())
     }
 
     pub fn setup_network(
-        &mut self,
+        &self,
         source_addr: u32,
         gateway_address: u32,
         mask: u32,
     ) -> Result<(), Error> {
+        let mut dev_guard = self.device.lock_mut()?;
+        let device = dev_guard.as_mut();
+
         // Unlock network settings
-        self.transport.write_u8(&NETLCKR, 0x3A)?;
+        device.transport.write_u8(&NETLCKR, 0x3A)?;
 
         let mac = self.mac;
-        self.transport.write(&SHAR, &mac)?;
-        self.transport.write_u32(&SIPR, source_addr)?;
-        self.transport.write_u32(&GAR, gateway_address)?;
-        self.transport.write_u32(&SUBR, mask)?;
+        device.transport.write(&SHAR, &mac)?;
+        device.transport.write_u32(&SIPR, source_addr)?;
+        device.transport.write_u32(&GAR, gateway_address)?;
+        device.transport.write_u32(&SUBR, mask)?;
 
         // Lock network settings
-        self.transport.write_u8(&NETLCKR, 0xC5)?;
+        device.transport.write_u8(&NETLCKR, 0xC5)?;
 
         Ok(())
     }
 
-    pub fn is_link_up(&mut self) -> Result<bool, Error> {
-        let status = PHYStatusFlags::from_bits_retain(self.transport.read_u8(&PHYSR)?);
+    pub fn is_link_up(&self) -> Result<bool, Error> {
+        let mut dev_guard = self.device.lock_mut()?;
+        let status =
+            PHYStatusFlags::from_bits_retain(dev_guard.as_mut().transport.read_u8(&PHYSR)?);
 
-        return Ok(
-            (status & PHYStatusFlags::CAB_MASK) == PHYStatusFlags::CAB_ON
-                && (status & PHYStatusFlags::LINK_MASK) == PHYStatusFlags::LINK_UP,
-        );
+        Ok((status & PHYStatusFlags::CAB_MASK) == PHYStatusFlags::CAB_ON
+            && (status & PHYStatusFlags::LINK_MASK) == PHYStatusFlags::LINK_UP)
     }
 
-    pub fn open<Socket: SocketAccess<'a, Transport<Spi>>>(
-        &mut self,
-        user_socket: &'a Socket,
-    ) -> Result<(), Error> {
-        for sock in self.sockets.iter_mut() {
-            if sock.is_free_to_use() {
-                let result = user_socket
-                    .lock_inner()?
-                    .as_mut()
-                    .init(&sock.block, &mut self.transport);
+    /// Open a TCP socket that actively connects to `addr:port` from `src_port`.
+    /// Allocates a free hardware socket and stages the buffers; the actual chip
+    /// `OPEN`/`CONNECT` happens on the next `run`. Returns a handle for I/O.
+    pub fn open_tcp_connect(
+        &'a self,
+        addr: u32,
+        port: u16,
+        src_port: u16,
+        rx: &'a mut [u8],
+        tx: &'a mut [u8],
+    ) -> Result<TcpSocket<'a>, Error> {
+        for cell in self.sockets.iter() {
+            let mut guard = match cell.lock_mut() {
+                Ok(guard) => guard,
+                Err(_) => continue,
+            };
 
-                match result {
-                    Ok(_) => {
-                        sock.accessor = Some(user_socket);
-                        return Ok(());
-                    }
-                    Err(e) => match e {
-                        Error::Busy => return Err(Error::Busy),
-                        e => {
-                            sock.reset(&mut self.transport)?;
-                            return Err(e);
-                        }
-                    },
-                }
+            if guard.as_mut().is_free() {
+                guard
+                    .as_mut()
+                    .claim_tcp(TcpSocketState::connect(addr, port, src_port, rx, tx));
+                drop(guard);
+
+                return Ok(TcpSocket::new(cell));
             }
         }
 
         Err(Error::Busy)
     }
 
-    pub fn run(&mut self) -> Result<(), Error> {
-        for sock in self.sockets.iter_mut() {
-            match sock.run(&mut self.transport) {
-                Ok(()) => (),
-                Err(e) => match e {
-                    Error::Busy => (),
-                    e => return Err(e),
-                },
+    /// Open a TCP socket that passively listens on `port`. As with
+    /// [`open_tcp_connect`](Self::open_tcp_connect), the chip work is deferred to
+    /// `run`.
+    pub fn open_tcp_listen(
+        &'a self,
+        port: u16,
+        rx: &'a mut [u8],
+        tx: &'a mut [u8],
+    ) -> Result<TcpSocket<'a>, Error> {
+        for cell in self.sockets.iter() {
+            let mut guard = match cell.lock_mut() {
+                Ok(guard) => guard,
+                Err(_) => continue,
             };
+
+            if guard.as_mut().is_free() {
+                guard.as_mut().claim_tcp(TcpSocketState::listen(port, rx, tx));
+                drop(guard);
+
+                return Ok(TcpSocket::new(cell));
+            }
         }
 
-        Ok(())
-    }
-}
-
-impl<'a, Trans: Transceiver> SocketBackend<'a, Trans> {
-    pub fn is_free_to_use(&self) -> bool {
-        self.accessor.is_none()
+        Err(Error::Busy)
     }
 
-    pub fn run(&mut self, transceiver: &mut Trans) -> Result<(), Error> {
-        if let Some(accesor) = self.accessor {
-            accesor.lock_inner()?.as_mut().run(&self.block, transceiver)
-        } else {
-            Ok(())
+    pub fn run(&self) -> Result<(), Error> {
+        let mut dev_guard = self.device.lock_mut()?;
+        let device = dev_guard.as_mut();
+
+        for cell in self.sockets.iter() {
+            // A socket currently held by a user handle is skipped this tick.
+            let mut guard = match cell.lock_mut() {
+                Ok(guard) => guard,
+                Err(_) => continue,
+            };
+
+            match guard.as_mut().run(&mut device.transport) {
+                Ok(()) => (),
+                Err(Error::Busy) => (),
+                Err(e) => return Err(e),
+            }
         }
-    }
-
-    pub fn reset(&mut self, transceiver: &mut Trans) -> Result<(), Error> {
-        self.accessor = None;
-
-        init_socket(&self.block, transceiver, SocketProtocolMode::CLOSED)?;
 
         Ok(())
     }
