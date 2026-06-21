@@ -3,9 +3,17 @@
 #![no_main]
 
 use cortex_m_rt::entry;
+use embedded_hal::delay::DelayNs;
+use embedded_hal_bus::spi::NoDelay;
 use nb::block;
 use panic_halt as _;
-use stm32f1xx_hal::{pac, prelude::*, rcc, spi, timer::Timer};
+use stm32f1xx_hal::{
+    pac::{self, SYST},
+    prelude::*,
+    rcc, spi,
+    time::MicroSeconds,
+    timer::{SysDelay, Timer},
+};
 
 mod w6100;
 use crate::w6100::W6100;
@@ -35,9 +43,6 @@ fn main() -> ! {
         phase: spi::Phase::CaptureOnFirstTransition,
     };
 
-    let mut timer = Timer::syst(cp.SYST, &rcc.clocks).counter_hz();
-    timer.start(1.Hz()).unwrap();
-
     let mut spi = dp.SPI1.spi(
         (Some(gpio_a.pa5), Some(gpio_a.pa6), Some(gpio_a.pa7)),
         spi_mode,
@@ -45,28 +50,37 @@ fn main() -> ! {
         &mut rcc,
     );
 
+    let mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
+
     let mut chip = W6100::new(
-        embedded_hal_bus::spi::ExclusiveDevice::new(spi, cs, embedded_hal_bus::spi::NoDelay)
-            .unwrap(),
+        embedded_hal_bus::spi::ExclusiveDevice::new(
+            spi,
+            cs,
+            Timer::syst(cp.SYST, &rcc.clocks).delay(),
+        )
+        .expect("Failed to create exclusive device"),
         rst,
-    );
-
-    // POR for W6100
-    rst.set_low();
-    cs.set_high();
-    block!(timer.wait()).ok();
-    rst.set_high();
-    block!(timer.wait()).ok();
-
-    chip.harware_reset().unwrap();
+        mac,
+    )
+    .expect("Failed to init W6100");
 
     // Wait for the timer to trigger an update and change the state of the LED
     loop {
-        cs.set_low();
-        let mut buff = [0x20, 0x16, 0b000_00_0_00, 0x00, 0x00];
-        spi.transfer(&mut buff).unwrap();
-        cs.set_high();
+        // Wait for link
+        while !chip.is_link_up().unwrap() {}
 
-        block!(timer.wait()).ok();
+        chip.setup_network(
+            u32::from_be_bytes([192, 168, 10, 10]),
+            u32::from_be_bytes([192, 168, 10, 1]),
+            u32::from_be_bytes([255, 255, 255, 0]),
+        )
+        .unwrap();
+
+        loop {
+            if !chip.is_link_up().unwrap() {
+                chip.reset().unwrap();
+                break;
+            }
+        }
     }
 }

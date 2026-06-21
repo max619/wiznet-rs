@@ -1,9 +1,11 @@
+use bitflags::bitflags;
 use embedded_hal::{
     digital::OutputPin,
     spi::{Operation, SpiDevice},
 };
 
-enum BlockSelectionBits {
+#[derive(Clone, Copy)]
+pub enum BlockSelectionBits {
     CommonRegister = 0,
 
     Socket0Register = 0b000_01,
@@ -39,115 +41,245 @@ enum BlockSelectionBits {
     Socket7RxBuffer = 0b111_11,
 }
 
-const CIDR: u16 = 0x0;
-const VER: u16 = 0x2;
+struct Address {
+    address: u16,
+    block: BlockSelectionBits,
+}
+
+const CIDR: Address = Address {
+    address: 0x0,
+    block: BlockSelectionBits::CommonRegister,
+};
+const VER: Address = Address {
+    address: 0x2,
+    block: BlockSelectionBits::CommonRegister,
+};
+
+///System Config Register 1
+const SYCR1: Address = Address {
+    address: 0x2005,
+    block: BlockSelectionBits::CommonRegister,
+};
+
+/// Source Hardware Address Register (MAC address)
+const SHAR: Address = Address {
+    address: 0x4120,
+    block: BlockSelectionBits::CommonRegister,
+};
+
+/// Gateway IP Address Register
+const GAR: Address = Address {
+    address: 0x4130,
+    block: BlockSelectionBits::CommonRegister,
+};
+
+/// Subnet Mask Register
+const SUBR: Address = Address {
+    address: 0x4134,
+    block: BlockSelectionBits::CommonRegister,
+};
+
+/// IPv4 Source Address Register
+const SIPR: Address = Address {
+    address: 0x4138,
+    block: BlockSelectionBits::CommonRegister,
+};
+
+/// Chip Lock Register
+const CHPLCKR: Address = Address {
+    address: 0x41F4,
+    block: BlockSelectionBits::CommonRegister,
+};
+
+/// Network Lock Register
+const NETLCKR: Address = Address {
+    address: 0x41F5,
+    block: BlockSelectionBits::CommonRegister,
+};
+
+/// SOCKET Interrupt Register
+const SIR: Address = Address {
+    address: 0x2101,
+    block: BlockSelectionBits::CommonRegister,
+};
+
+/// SOCKET Interrupt Mask Register
+const SIMR: Address = Address {
+    address: 0x2114,
+    block: BlockSelectionBits::CommonRegister,
+};
+
+/// PHY Status Register
+const PHYSR: Address = Address {
+    address: 0x3000,
+    block: BlockSelectionBits::CommonRegister,
+};
+
+bitflags! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    struct PHYStatusFlags: u8 {
+        /// Cable OFF bit
+        const CAB_MASK = 1 << 7;
+        const CAB_OFF = Self::CAB_MASK.bits();
+        const CAB_ON =0;
+
+        const MODE_MASK = 0b111 << 3;
+        const AUTO_NEGOTIATION = 0b000 << 3;
+        const BASE100_TX_FDX = 0b100 << 3;
+        const BASE100_TX_HDX = 0b101 << 3;
+        const BASE10_T_FDX = 0b110 << 3;
+        const BASE10_T_HDX = 0b111 << 3;
+
+        const DUPLEX_MASK = 1 << 2;
+        const DUPLEX_HALF = Self::DUPLEX_MASK.bits();
+        const DUPLEX_FULL = 0;
+
+        const SPEED_MASK = 1 << 1;
+        const SPEED_10 = Self::SPEED_MASK.bits();
+        const SPEED_100 = 0;
+
+        const LINK_MASK = 1 ;
+        const LINK_UP = Self::LINK_MASK.bits();
+        const LINK_DOWN = 0;
+    }
+}
+
+pub type MacAddress = [u8; 6];
 
 pub struct W6100<Spi: SpiDevice<u8>, RstPin: OutputPin> {
     spi: Spi,
     rst: RstPin,
+    mac: MacAddress,
 }
 
-pub enum Error<Spi: SpiDevice<u8>> {
-    SpiError(Spi::Error),
+#[derive(Debug)]
+pub enum Error {
+    SpiError,
+    PinError,
 
     UnexpectedResponse,
 }
 
 macro_rules! impl_read_primitive {
     ($name:ident, $t:ty) => {
-        fn $name(&mut self, addr: u16, block: BlockSelectionBits) -> Result<$t, Error<Spi>> {
+        fn $name(&mut self, addr: &Address) -> Result<$t, Error> {
             let mut buf = [0u8; size_of::<$t>()];
-            self.read(addr, block, &mut buf)?;
+            self.read(addr, &mut buf)?;
 
             Ok(<$t>::from_be_bytes(buf))
         }
     };
 }
 
-pub trait Transceiver<Spi: SpiDevice<u8>> {
-    fn read(
-        &mut self,
-        addr: u16,
-        block: BlockSelectionBits,
-        data: &mut [u8],
-    ) -> Result<(), Error<Spi>>;
+macro_rules! impl_write_primitive {
+    ($name:ident, $t:ty) => {
+        fn $name(&mut self, addr: &Address, value: $t) -> Result<(), Error> {
+            let buf = value.to_be_bytes();
+            self.write(addr, &buf)
+        }
+    };
+}
 
-    fn write(
-        &mut self,
-        addr: u16,
-        block: BlockSelectionBits,
-        data: &[u8],
-    ) -> Result<(), Error<Spi>>;
+pub trait Transceiver<Spi: SpiDevice<u8>> {
+    fn read(&mut self, addr: &Address, data: &mut [u8]) -> Result<(), Error>;
+
+    fn write(&mut self, addr: &Address, data: &[u8]) -> Result<(), Error>;
 
     impl_read_primitive!(read_u8, u8);
     impl_read_primitive!(read_u16, u16);
     impl_read_primitive!(read_u32, u32);
+
+    impl_write_primitive!(write_u8, u8);
+    impl_write_primitive!(write_u16, u16);
+    impl_write_primitive!(write_u32, u32);
 }
 
 impl<Spi: SpiDevice<u8>, RstPin: OutputPin> Transceiver<Spi> for W6100<Spi, RstPin> {
-    fn read(
-        &mut self,
-        addr: u16,
-        block: BlockSelectionBits,
-        data: &mut [u8],
-    ) -> Result<(), Error<Spi>> {
+    fn read(&mut self, addr: &Address, data: &mut [u8]) -> Result<(), Error> {
         let mut buf = [0u8; 3];
 
-        buf[0..2].copy_from_slice(&addr.to_be_bytes());
-        buf[3] = (block as u8) << 3;
+        buf[0..2].copy_from_slice(&addr.address.to_be_bytes());
+        buf[2] = (addr.block as u8) << 3;
 
         self.spi
             .transaction(&mut [Operation::Write(&buf), Operation::Read(data)])
-            .into()
+            .map_err(|_| Error::SpiError)
     }
 
-    fn write(
-        &mut self,
-        addr: u16,
-        block: BlockSelectionBits,
-        data: &[u8],
-    ) -> Result<(), Error<Spi>> {
+    fn write(&mut self, addr: &Address, data: &[u8]) -> Result<(), Error> {
         let mut buf = [0u8; 3];
 
-        buf[0..2].copy_from_slice(&addr.to_be_bytes());
-        buf[3] = (block as u8) << 3 | 2;
+        buf[0..2].copy_from_slice(&addr.address.to_be_bytes());
+        buf[2] = (addr.block as u8) << 3 | 2;
 
         self.spi
             .transaction(&mut [Operation::Write(&buf), Operation::Write(data)])
-            .into()
+            .map_err(|e| Error::SpiError)
     }
 }
 
 impl<Spi: SpiDevice<u8>, RstPin: OutputPin> W6100<Spi, RstPin> {
-    pub fn new(spi: Spi, rst: RstPin) -> Self {
-        W6100 { spi, rst }
+    pub fn new(spi: Spi, rst: RstPin, mac: MacAddress) -> Result<Self, Error> {
+        let mut this = W6100 { spi, rst, mac };
+
+        this.reset()?;
+        Ok(this)
     }
 
-    pub fn assert_reset(&mut self) -> Result<(), Error<Spi>> {
-        self.rst.set_low()?;
+    pub fn reset(&mut self) -> Result<(), Error> {
+        self.rst.set_low().map_err(|_| Error::PinError)?;
+
+        self.spi
+            .transaction(&mut [Operation::DelayNs(1_000_000)])
+            .map_err(|_| Error::SpiError)?;
+
+        self.rst.set_high().map_err(|_| Error::PinError)?;
+
+        if self.read_u16(&CIDR)? != 0x6100 {
+            return Err(Error::UnexpectedResponse);
+        }
+
+        if self.read_u16(&VER)? != 0x4661 {
+            return Err(Error::UnexpectedResponse);
+        }
+
+        // Unlock SYSR registers
+        self.write_u8(&CHPLCKR, 0xCE)?;
+        // Enable interrupts, clock-select 100Mhz
+        self.write_u8(&SYCR1, 0b10000000)?;
+        // Lock SYSR registers
+        self.write_u8(&CHPLCKR, 0x00)?;
 
         Ok(())
     }
 
-    pub fn harware_reset(&mut self) -> Result<(), Error<Spi>> {
-        self.rst.set_high()?;
+    pub fn setup_network(
+        &mut self,
+        source_addr: u32,
+        gateway_address: u32,
+        mask: u32,
+    ) -> Result<(), Error> {
+        // Unlock network settings
+        self.write_u8(&NETLCKR, 0x3A)?;
 
-        if self.get_cidr()? != 0x6100 {
-            return Err(Error::UnexpectedResponse);
-        }
+        let mac = self.mac;
+        self.write(&SHAR, &mac)?;
+        self.write_u32(&SIPR, source_addr)?;
+        self.write_u32(&GAR, gateway_address)?;
+        self.write_u32(&SUBR, mask)?;
 
-        if self.get_version()? != 0x4641 {
-            return Err(Error::UnexpectedResponse);
-        }
+        // Lock network settings
+        self.write_u8(&NETLCKR, 0xC5)?;
 
         Ok(())
     }
 
-    pub fn get_cidr(&mut self) -> Result<u16, Error<Spi>> {
-        self.read_u16(CIDR, BlockSelectionBits::CommonRegister)
-    }
+    pub fn is_link_up(&mut self) -> Result<bool, Error> {
+        let status = PHYStatusFlags::from_bits_retain(self.read_u8(&PHYSR)?);
 
-    pub fn get_version(&mut self) -> Result<u16, Error<Spi>> {
-        self.read_u16(VER, BlockSelectionBits::CommonRegister)
+        return Ok(
+            (status & PHYStatusFlags::CAB_MASK) == PHYStatusFlags::CAB_ON
+                && (status & PHYStatusFlags::LINK_MASK) == PHYStatusFlags::LINK_UP,
+        );
     }
 }
