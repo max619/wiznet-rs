@@ -8,7 +8,11 @@ use embedded_hal::{
 
 mod atomic_cell;
 
-use crate::w6100::socket::{SocketInternal, SocketProtocolMode};
+use crate::w6100::{
+    socket::{SocketAccess, SocketInternal, SocketProtocolMode},
+    socket_common::init_socket,
+    transiver::BlockAddress,
+};
 
 use self::atomic_cell::{AtomicCell, AtomicError};
 
@@ -16,7 +20,9 @@ mod transiver;
 use self::transiver::{Address, BlockSelectionBits, Transceiver};
 
 mod socket;
-use self::socket::SocketState;
+pub use socket::PinnedSocket;
+
+mod socket_common;
 
 mod tcp_socket;
 pub use self::tcp_socket::TcpSocket;
@@ -121,19 +127,10 @@ bitflags! {
 
 pub type MacAddress = [u8; 6];
 
-struct BlockAddress {
-    reg: BlockSelectionBits,
-    tx: BlockSelectionBits,
-    rx: BlockSelectionBits,
-}
-
 struct SocketBackend<'a, Trans: Transceiver> {
     block: BlockAddress,
 
-    mode: SocketProtocolMode,
-    state: Option<&'a AtomicCell<SocketState<'a>>>,
-
-    _ph: PhantomData<Trans>,
+    accessor: Option<&'a dyn SocketAccess<'a, Trans>>,
 }
 
 pub struct Transport<Spi: SpiDevice<u8>> {
@@ -148,7 +145,7 @@ pub struct W6100<'a, Spi: SpiDevice<u8>, RstPin: OutputPin> {
     sockets: [SocketBackend<'a, Transport<Spi>>; 8],
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum Error {
     SpiError,
     PinError,
@@ -201,10 +198,7 @@ impl<'a, Spi: SpiDevice<u8>, RstPin: OutputPin> W6100<'a, Spi, RstPin> {
                         tx: BlockSelectionBits::Socket0TxBuffer,
                         rx: BlockSelectionBits::Socket0RxBuffer,
                     },
-                    mode: SocketProtocolMode::CLOSED,
-                    state: None,
-
-                    _ph: PhantomData::<Transport<Spi>>,
+                    accessor: None,
                 },
                 SocketBackend {
                     block: BlockAddress {
@@ -212,10 +206,8 @@ impl<'a, Spi: SpiDevice<u8>, RstPin: OutputPin> W6100<'a, Spi, RstPin> {
                         tx: BlockSelectionBits::Socket1TxBuffer,
                         rx: BlockSelectionBits::Socket1RxBuffer,
                     },
-                    mode: SocketProtocolMode::CLOSED,
-                    state: None,
 
-                    _ph: PhantomData::<Transport<Spi>>,
+                    accessor: None,
                 },
                 SocketBackend {
                     block: BlockAddress {
@@ -223,10 +215,7 @@ impl<'a, Spi: SpiDevice<u8>, RstPin: OutputPin> W6100<'a, Spi, RstPin> {
                         tx: BlockSelectionBits::Socket2TxBuffer,
                         rx: BlockSelectionBits::Socket2RxBuffer,
                     },
-                    mode: SocketProtocolMode::CLOSED,
-                    state: None,
-
-                    _ph: PhantomData::<Transport<Spi>>,
+                    accessor: None,
                 },
                 SocketBackend {
                     block: BlockAddress {
@@ -234,10 +223,7 @@ impl<'a, Spi: SpiDevice<u8>, RstPin: OutputPin> W6100<'a, Spi, RstPin> {
                         tx: BlockSelectionBits::Socket3TxBuffer,
                         rx: BlockSelectionBits::Socket3RxBuffer,
                     },
-                    mode: SocketProtocolMode::CLOSED,
-                    state: None,
-
-                    _ph: PhantomData::<Transport<Spi>>,
+                    accessor: None,
                 },
                 SocketBackend {
                     block: BlockAddress {
@@ -245,10 +231,7 @@ impl<'a, Spi: SpiDevice<u8>, RstPin: OutputPin> W6100<'a, Spi, RstPin> {
                         tx: BlockSelectionBits::Socket4TxBuffer,
                         rx: BlockSelectionBits::Socket4RxBuffer,
                     },
-                    mode: SocketProtocolMode::CLOSED,
-                    state: None,
-
-                    _ph: PhantomData::<Transport<Spi>>,
+                    accessor: None,
                 },
                 SocketBackend {
                     block: BlockAddress {
@@ -256,10 +239,7 @@ impl<'a, Spi: SpiDevice<u8>, RstPin: OutputPin> W6100<'a, Spi, RstPin> {
                         tx: BlockSelectionBits::Socket5TxBuffer,
                         rx: BlockSelectionBits::Socket5RxBuffer,
                     },
-                    mode: SocketProtocolMode::CLOSED,
-                    state: None,
-
-                    _ph: PhantomData::<Transport<Spi>>,
+                    accessor: None,
                 },
                 SocketBackend {
                     block: BlockAddress {
@@ -267,10 +247,7 @@ impl<'a, Spi: SpiDevice<u8>, RstPin: OutputPin> W6100<'a, Spi, RstPin> {
                         tx: BlockSelectionBits::Socket6TxBuffer,
                         rx: BlockSelectionBits::Socket6RxBuffer,
                     },
-                    mode: SocketProtocolMode::CLOSED,
-                    state: None,
-
-                    _ph: PhantomData::<Transport<Spi>>,
+                    accessor: None,
                 },
                 SocketBackend {
                     block: BlockAddress {
@@ -278,10 +255,7 @@ impl<'a, Spi: SpiDevice<u8>, RstPin: OutputPin> W6100<'a, Spi, RstPin> {
                         tx: BlockSelectionBits::Socket7TxBuffer,
                         rx: BlockSelectionBits::Socket7RxBuffer,
                     },
-                    mode: SocketProtocolMode::CLOSED,
-                    state: None,
-
-                    _ph: PhantomData::<Transport<Spi>>,
+                    accessor: None,
                 },
             ],
         };
@@ -292,13 +266,6 @@ impl<'a, Spi: SpiDevice<u8>, RstPin: OutputPin> W6100<'a, Spi, RstPin> {
 
     pub fn reset(&mut self) -> Result<(), Error> {
         self.rst.set_low().map_err(|_| Error::PinError)?;
-
-        for sock in self.sockets.iter_mut().by_ref() {
-            sock.mode = SocketProtocolMode::CLOSED;
-
-            // @todo: invalidate the state if exists
-            sock.state = None;
-        }
 
         self.transport
             .spi
@@ -313,6 +280,10 @@ impl<'a, Spi: SpiDevice<u8>, RstPin: OutputPin> W6100<'a, Spi, RstPin> {
 
         if self.transport.read_u16(&VER)? != 0x4661 {
             return Err(Error::UnexpectedResponse);
+        }
+
+        for sock in self.sockets.iter_mut().by_ref() {
+            sock.reset(&mut self.transport)?;
         }
 
         // Unlock SYSR registers
@@ -355,16 +326,30 @@ impl<'a, Spi: SpiDevice<u8>, RstPin: OutputPin> W6100<'a, Spi, RstPin> {
         );
     }
 
-    pub fn open<Socket: SocketInternal<'a, Transport<Spi>>>(
+    pub fn open<Socket: SocketAccess<'a, Transport<Spi>>>(
         &mut self,
         user_socket: &'a Socket,
     ) -> Result<(), Error> {
         for sock in self.sockets.iter_mut() {
             if sock.is_free_to_use() {
-                sock.mode = Socket::MODE;
-                sock.state = Some(user_socket.get_state());
+                let result = user_socket
+                    .lock_inner()?
+                    .as_mut()
+                    .init(&sock.block, &mut self.transport);
 
-                return Ok(());
+                match result {
+                    Ok(_) => {
+                        sock.accessor = Some(user_socket);
+                        return Ok(());
+                    }
+                    Err(e) => match e {
+                        Error::Busy => return Err(Error::Busy),
+                        e => {
+                            sock.reset(&mut self.transport)?;
+                            return Err(e);
+                        }
+                    },
+                }
             }
         }
 
@@ -388,23 +373,21 @@ impl<'a, Spi: SpiDevice<u8>, RstPin: OutputPin> W6100<'a, Spi, RstPin> {
 
 impl<'a, Trans: Transceiver> SocketBackend<'a, Trans> {
     pub fn is_free_to_use(&self) -> bool {
-        self.mode == SocketProtocolMode::CLOSED && self.state.is_none()
+        self.accessor.is_none()
     }
 
     pub fn run(&mut self, transceiver: &mut Trans) -> Result<(), Error> {
-        if self.state.is_none() && self.mode != SocketProtocolMode::CLOSED {
-            panic!("inner socket state is none, but mode is not closed");
-        }
-
-        match &self.mode {
-            &SocketProtocolMode::CLOSED => Ok(()),
-            &SocketProtocolMode::TCP4 | &SocketProtocolMode::TCP6 => self.run_tcp(transceiver),
-            _ => todo!(),
+        if let Some(accesor) = self.accessor {
+            accesor.lock_inner()?.as_mut().run(&self.block, transceiver)
+        } else {
+            Ok(())
         }
     }
 
-    fn run_tcp(&mut self, transceiver: &mut Trans) -> Result<(), Error> {
-        let state = self.state.unwrap().lock_mut()?;
+    pub fn reset(&mut self, transceiver: &mut Trans) -> Result<(), Error> {
+        self.accessor = None;
+
+        init_socket(&self.block, transceiver, SocketProtocolMode::CLOSED)?;
 
         Ok(())
     }

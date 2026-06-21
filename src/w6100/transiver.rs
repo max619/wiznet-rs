@@ -37,6 +37,12 @@ pub enum BlockSelectionBits {
     Socket7RxBuffer = 0b111_11,
 }
 
+pub struct BlockAddress {
+    pub(crate) reg: BlockSelectionBits,
+    pub(crate) tx: BlockSelectionBits,
+    pub(crate) rx: BlockSelectionBits,
+}
+
 pub struct Address {
     pub(crate) address: u16,
     pub(crate) block: BlockSelectionBits,

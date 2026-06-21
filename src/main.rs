@@ -12,7 +12,7 @@ use stm32f1xx_hal::{
 };
 
 mod w6100;
-use crate::w6100::{TcpSocket, W6100};
+use crate::w6100::{PinnedSocket, TcpSocket, W6100};
 
 #[entry]
 fn main() -> ! {
@@ -46,7 +46,7 @@ fn main() -> ! {
         &mut rcc,
     );
 
-    let mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
+    let mac = [0xfc, 0xd7, 0xfd, 0xab, 0x8b, 0xe4];
 
     let mut chip = W6100::new(
         embedded_hal_bus::spi::ExclusiveDevice::new(
@@ -63,7 +63,8 @@ fn main() -> ! {
     let mut rx = [0u8; 512];
     let mut tx = [0u8; 512];
 
-    let sock = TcpSocket::new(1000, &mut rx, &mut tx);
+    let mut sock = TcpSocket::connect(u32::from_be_bytes([192, 168, 10, 1]), 80, &mut rx, &mut tx);
+    let pinned_sock = PinnedSocket::pin(&mut sock);
 
     // Wait for the timer to trigger an update and change the state of the LED
     loop {
@@ -77,6 +78,8 @@ fn main() -> ! {
         )
         .unwrap();
 
+        chip.open(&pinned_sock).unwrap();
+
         loop {
             if !chip.is_link_up().unwrap() {
                 chip.reset().unwrap();
@@ -84,8 +87,6 @@ fn main() -> ! {
             }
 
             chip.run().unwrap();
-
-            chip.open(&sock).unwrap();
         }
     }
 }
