@@ -382,6 +382,60 @@ pub(crate) fn send_sock_command<Trans: Transceiver>(
     )
 }
 
+/// Number of bytes currently waiting in the SOCKET's RX buffer on the chip.
+pub(crate) fn get_rx_received_size<Trans: Transceiver>(
+    block: &BlockAddress,
+    trans: &mut Trans,
+) -> Result<u16, Error> {
+    trans.read_u16(&Address {
+        address: SN_RX_RSR0,
+        block: block.reg,
+    })
+}
+
+/// Current RX read pointer (Sn_RX_RD) — a free-running 16-bit offset.
+pub(crate) fn get_rx_read_pointer<Trans: Transceiver>(
+    block: &BlockAddress,
+    trans: &mut Trans,
+) -> Result<u16, Error> {
+    trans.read_u16(&Address {
+        address: SN_RX_RD0,
+        block: block.reg,
+    })
+}
+
+/// Advance the RX read pointer (Sn_RX_RD) after consuming data.
+pub(crate) fn set_rx_read_pointer<Trans: Transceiver>(
+    block: &BlockAddress,
+    trans: &mut Trans,
+    pointer: u16,
+) -> Result<(), Error> {
+    trans.write_u16(
+        &Address {
+            address: SN_RX_RD0,
+            block: block.reg,
+        },
+        pointer,
+    )
+}
+
+/// Burst-read `data.len()` bytes out of the SOCKET's RX buffer starting at the
+/// given pointer. The chip auto-increments and wraps within the buffer region.
+pub(crate) fn read_rx_buffer<Trans: Transceiver>(
+    block: &BlockAddress,
+    trans: &mut Trans,
+    pointer: u16,
+    data: &mut [u8],
+) -> Result<(), Error> {
+    trans.read(
+        &Address {
+            address: pointer,
+            block: block.rx,
+        },
+        data,
+    )
+}
+
 pub(crate) fn is_command_pending<Trans: Transceiver>(
     block: &BlockAddress,
     trans: &mut Trans,

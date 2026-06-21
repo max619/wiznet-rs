@@ -24,6 +24,8 @@ pub use socket::PinnedSocket;
 
 mod socket_common;
 
+mod ring_buffer;
+
 mod tcp_socket;
 pub use self::tcp_socket::TcpSocket;
 

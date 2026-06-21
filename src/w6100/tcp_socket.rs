@@ -3,10 +3,12 @@ use core::marker::PhantomData;
 use crate::w6100::{
     Error,
     socket::{SocketInternal, SocketProtocolMode, SocketStatus, UserSocket},
+    ring_buffer::RingBuffer,
     socket_common::{
         SocketCommand, SocketInterrupt, SocketStatusRegister, clear_interrupts, get_interrupts,
-        init_socket, is_command_pending, read_status, send_sock_command, set_dst_port,
-        set_ipv4_dst_addr, set_src_port,
+        get_rx_read_pointer, get_rx_received_size, init_socket, is_command_pending, read_rx_buffer,
+        read_status, send_sock_command, set_dst_port, set_ipv4_dst_addr, set_rx_read_pointer,
+        set_src_port,
     },
     tcp_socket::TcpMode::{Connect, Listen},
     transiver::{Address, BlockAddress, Transceiver},
@@ -27,8 +29,8 @@ pub struct TcpSocket<'a, Trans: Transceiver> {
     mode: TcpMode,
     status: SocketStatus,
 
-    rx_buffer: &'a mut [u8],
-    tx_buffer: &'a mut [u8],
+    rx_buffer: RingBuffer<'a>,
+    tx_buffer: RingBuffer<'a>,
 
     pending_error: Option<Error>,
 
@@ -51,8 +53,8 @@ impl<'a, Trans: Transceiver> TcpSocket<'a, Trans> {
             },
             status: SocketStatus::Init,
 
-            rx_buffer,
-            tx_buffer,
+            rx_buffer: RingBuffer::new(rx_buffer),
+            tx_buffer: RingBuffer::new(tx_buffer),
 
             pending_error: None,
 
@@ -65,13 +67,21 @@ impl<'a, Trans: Transceiver> TcpSocket<'a, Trans> {
             mode: Listen { src_port: port },
             status: SocketStatus::Init,
 
-            rx_buffer,
-            tx_buffer,
+            rx_buffer: RingBuffer::new(rx_buffer),
+            tx_buffer: RingBuffer::new(tx_buffer),
 
             pending_error: None,
 
             _ph: PhantomData::<Trans>,
         }
+    }
+
+    /// Drain up to `dst.len()` bytes that have been received and buffered
+    /// locally. Returns the number of bytes copied (0 if nothing is buffered).
+    /// Non-blocking: it only reads what [`run`](SocketInternal::run) has already
+    /// pulled off the chip.
+    pub fn read(&mut self, dst: &mut [u8]) -> usize {
+        self.rx_buffer.read(dst)
     }
 
     fn raise_pending_error(&mut self) -> Result<(), Error> {
@@ -186,6 +196,49 @@ impl<'a, Trans: Transceiver> TcpSocket<'a, Trans> {
         }
     }
 
+    /// Move any data waiting in the chip's RX buffer into the local rx ring,
+    /// limited by the room available there. Anything that doesn't fit is left
+    /// on the chip and picked up on a later tick. Non-blocking.
+    ///
+    /// Returns the number of bytes still sitting in the chip's RX buffer after
+    /// this pass (non-zero only when the local ring filled up). A return of `0`
+    /// means the chip buffer is fully drained.
+    fn receive(&mut self, block: &BlockAddress, trans: &mut Trans) -> Result<usize, Error> {
+        let available = get_rx_received_size(block, trans)? as usize;
+        if available == 0 {
+            return Ok(0);
+        }
+
+        let to_read = core::cmp::min(available, self.rx_buffer.free());
+        if to_read == 0 {
+            // No local room; leave the data on the chip and try again later.
+            return Ok(available);
+        }
+
+        // The local ring may wrap, so copy in up to two contiguous chunks. The
+        // chip auto-advances/wraps its own buffer, so we just keep stepping the
+        // read pointer by the amount consumed.
+        let mut pointer = get_rx_read_pointer(block, trans)?;
+        let mut remaining = to_read;
+        while remaining > 0 {
+            let region = self.rx_buffer.writable();
+            let n = core::cmp::min(region.len(), remaining);
+
+            read_rx_buffer(block, trans, pointer, &mut region[..n])?;
+            self.rx_buffer.advance_write(n);
+
+            pointer = pointer.wrapping_add(n as u16);
+            remaining -= n;
+        }
+
+        // Commit the consumed bytes back to the chip and free its buffer.
+        set_rx_read_pointer(block, trans, pointer)?;
+        send_sock_command(block, trans, SocketCommand::Receive)?;
+        clear_interrupts(block, trans, SocketInterrupt::RECV)?;
+
+        Ok(available - to_read)
+    }
+
     /// Idle health-check for an established connection: watch for the failure
     /// and teardown conditions that can occur while we are not actively
     /// sending or receiving.
@@ -210,13 +263,25 @@ impl<'a, Trans: Transceiver> TcpSocket<'a, Trans> {
         }
 
         match read_status(block, trans)? {
-            // Still connected and healthy — nothing to do this tick.
-            SocketStatusRegister::Established => Ok(()),
+            // Still connected and healthy — pull down any pending data.
+            SocketStatusRegister::Established => {
+                self.receive(block, trans)?;
 
-            // Peer initiated a graceful close (sent FIN). Close our side too.
+                Ok(())
+            }
+
+            // Peer initiated a graceful close (sent FIN). Keep draining the
+            // chip's RX buffer into our local ring; only close our side once
+            // every byte is off the chip (the consumer may still drain the
+            // local ring afterwards). If the ring is full we stay here and
+            // retry next tick once `read` frees space.
             SocketStatusRegister::CloseWait => {
-                send_sock_command(block, trans, SocketCommand::Disconnect)?;
-                self.status = SocketStatus::Closing;
+                let pending = self.receive(block, trans)?;
+
+                if pending == 0 {
+                    send_sock_command(block, trans, SocketCommand::Disconnect)?;
+                    self.status = SocketStatus::Closing;
+                }
 
                 Ok(())
             }
