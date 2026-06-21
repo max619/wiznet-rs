@@ -1,3 +1,5 @@
+use core::marker::PhantomData;
+
 use bitflags::bitflags;
 use embedded_hal::{
     digital::OutputPin,
@@ -144,12 +146,48 @@ bitflags! {
     }
 }
 
+bitflags! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    struct SocketProtocolMode: u8 {
+        const CLOSED = 0b0000;
+        const TCP4 = 0b0001;
+        const UDP4 = 0b0010;
+        const IPRAW4 = 0b0011;
+        const MACRAW = 0b0111;
+        const TCP6 = 0b1001;
+        const UDP6 = 0b1010;
+        const IPRAW6 = 0b1011;
+        const TCP_DUAL = 0b1101;
+        const UDP_DUAL = 0b1110;
+        const MASK = 0b1111;
+    }
+}
+
 pub type MacAddress = [u8; 6];
 
-pub struct W6100<Spi: SpiDevice<u8>, RstPin: OutputPin> {
+struct SocketBuffers<'b> {
+    rx: &'b mut [u8],
+    tx: &'b mut [u8],
+}
+
+struct SocketBackend<'b, Trans: Transceiver> {
+    reg: BlockSelectionBits,
+    tx: BlockSelectionBits,
+    rx: BlockSelectionBits,
+
+    mode: SocketProtocolMode,
+
+    buffers: Option<SocketBuffers<'b>>,
+
+    _ph: PhantomData<Trans>,
+}
+
+pub struct W6100<'b, Spi: SpiDevice<u8>, RstPin: OutputPin> {
     spi: Spi,
     rst: RstPin,
     mac: MacAddress,
+
+    sockets: [SocketBackend<'b, Self>; 8],
 }
 
 #[derive(Debug)]
@@ -180,7 +218,7 @@ macro_rules! impl_write_primitive {
     };
 }
 
-pub trait Transceiver<Spi: SpiDevice<u8>> {
+trait Transceiver {
     fn read(&mut self, addr: &Address, data: &mut [u8]) -> Result<(), Error>;
 
     fn write(&mut self, addr: &Address, data: &[u8]) -> Result<(), Error>;
@@ -194,7 +232,7 @@ pub trait Transceiver<Spi: SpiDevice<u8>> {
     impl_write_primitive!(write_u32, u32);
 }
 
-impl<Spi: SpiDevice<u8>, RstPin: OutputPin> Transceiver<Spi> for W6100<Spi, RstPin> {
+impl<'b, Spi: SpiDevice<u8>, RstPin: OutputPin> Transceiver for W6100<'b, Spi, RstPin> {
     fn read(&mut self, addr: &Address, data: &mut [u8]) -> Result<(), Error> {
         let mut buf = [0u8; 3];
 
@@ -218,9 +256,87 @@ impl<Spi: SpiDevice<u8>, RstPin: OutputPin> Transceiver<Spi> for W6100<Spi, RstP
     }
 }
 
-impl<Spi: SpiDevice<u8>, RstPin: OutputPin> W6100<Spi, RstPin> {
+impl<'b, Spi: SpiDevice<u8>, RstPin: OutputPin> W6100<'b, Spi, RstPin> {
     pub fn new(spi: Spi, rst: RstPin, mac: MacAddress) -> Result<Self, Error> {
-        let mut this = W6100 { spi, rst, mac };
+        let mut this = W6100 {
+            spi,
+            rst,
+            mac,
+            sockets: [
+                SocketBackend {
+                    reg: BlockSelectionBits::Socket0Register,
+                    tx: BlockSelectionBits::Socket0TxBuffer,
+                    rx: BlockSelectionBits::Socket0RxBuffer,
+                    mode: SocketProtocolMode::CLOSED,
+                    buffers: None,
+
+                    _ph: PhantomData::<Self>,
+                },
+                SocketBackend {
+                    reg: BlockSelectionBits::Socket1Register,
+                    tx: BlockSelectionBits::Socket1TxBuffer,
+                    rx: BlockSelectionBits::Socket1RxBuffer,
+                    mode: SocketProtocolMode::CLOSED,
+                    buffers: None,
+
+                    _ph: PhantomData::<Self>,
+                },
+                SocketBackend {
+                    reg: BlockSelectionBits::Socket2Register,
+                    tx: BlockSelectionBits::Socket2TxBuffer,
+                    rx: BlockSelectionBits::Socket2RxBuffer,
+                    mode: SocketProtocolMode::CLOSED,
+                    buffers: None,
+
+                    _ph: PhantomData::<Self>,
+                },
+                SocketBackend {
+                    reg: BlockSelectionBits::Socket3Register,
+                    tx: BlockSelectionBits::Socket3TxBuffer,
+                    rx: BlockSelectionBits::Socket3RxBuffer,
+                    mode: SocketProtocolMode::CLOSED,
+                    buffers: None,
+
+                    _ph: PhantomData::<Self>,
+                },
+                SocketBackend {
+                    reg: BlockSelectionBits::Socket4Register,
+                    tx: BlockSelectionBits::Socket4TxBuffer,
+                    rx: BlockSelectionBits::Socket4RxBuffer,
+                    mode: SocketProtocolMode::CLOSED,
+                    buffers: None,
+
+                    _ph: PhantomData::<Self>,
+                },
+                SocketBackend {
+                    reg: BlockSelectionBits::Socket5Register,
+                    tx: BlockSelectionBits::Socket5TxBuffer,
+                    rx: BlockSelectionBits::Socket5RxBuffer,
+                    mode: SocketProtocolMode::CLOSED,
+                    buffers: None,
+
+                    _ph: PhantomData::<Self>,
+                },
+                SocketBackend {
+                    reg: BlockSelectionBits::Socket6Register,
+                    tx: BlockSelectionBits::Socket6TxBuffer,
+                    rx: BlockSelectionBits::Socket6RxBuffer,
+                    mode: SocketProtocolMode::CLOSED,
+                    buffers: None,
+
+                    _ph: PhantomData::<Self>,
+                },
+                SocketBackend {
+                    reg: BlockSelectionBits::Socket7Register,
+                    tx: BlockSelectionBits::Socket7TxBuffer,
+                    rx: BlockSelectionBits::Socket7RxBuffer,
+                    mode: SocketProtocolMode::CLOSED,
+                    buffers: None,
+
+                    _ph: PhantomData::<Self>,
+                },
+            ],
+        };
 
         this.reset()?;
         Ok(this)
@@ -228,6 +344,11 @@ impl<Spi: SpiDevice<u8>, RstPin: OutputPin> W6100<Spi, RstPin> {
 
     pub fn reset(&mut self) -> Result<(), Error> {
         self.rst.set_low().map_err(|_| Error::PinError)?;
+
+        for sock in self.sockets.iter_mut().by_ref() {
+            sock.buffers = None;
+            sock.mode = SocketProtocolMode::CLOSED;
+        }
 
         self.spi
             .transaction(&mut [Operation::DelayNs(1_000_000)])
@@ -282,4 +403,16 @@ impl<Spi: SpiDevice<u8>, RstPin: OutputPin> W6100<Spi, RstPin> {
                 && (status & PHYStatusFlags::LINK_MASK) == PHYStatusFlags::LINK_UP,
         );
     }
+
+    pub fn run(&mut self) -> Result<(), Error> {
+        for sock in self.sockets.iter().by_ref() {
+            sock.run(self)?;
+        }
+
+        Ok(())
+    }
+}
+
+impl<'b, Trans: Transceiver> SocketBackend<'b, Trans> {
+    pub fn run(&mut self, transceiver: &mut Trans) -> Result<(), Error> {}
 }
