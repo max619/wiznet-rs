@@ -186,8 +186,56 @@ impl<'a, Trans: Transceiver> TcpSocket<'a, Trans> {
         }
     }
 
+    /// Idle health-check for an established connection: watch for the failure
+    /// and teardown conditions that can occur while we are not actively
+    /// sending or receiving.
     fn handle_established(&mut self, block: &BlockAddress, trans: &mut Trans) -> Result<(), Error> {
-        Ok(())
+        let interrupts = get_interrupts(block, trans)?;
+
+        // Retransmission / keep-alive timeout: the peer is unreachable, so the
+        // connection is dead. Tear it down and report it as a timeout.
+        if interrupts.contains(SocketInterrupt::TIMEOUT) {
+            clear_interrupts(block, trans, SocketInterrupt::TIMEOUT)?;
+
+            send_sock_command(block, trans, SocketCommand::Close)?;
+            self.status = SocketStatus::ClosingDueToTimeout;
+
+            return Ok(());
+        }
+
+        // FIN received from the peer. Acknowledge the interrupt; the status
+        // register below tells us how far the teardown has progressed.
+        if interrupts.contains(SocketInterrupt::DISCON) {
+            clear_interrupts(block, trans, SocketInterrupt::DISCON)?;
+        }
+
+        match read_status(block, trans)? {
+            // Still connected and healthy — nothing to do this tick.
+            SocketStatusRegister::Established => Ok(()),
+
+            // Peer initiated a graceful close (sent FIN). Close our side too.
+            SocketStatusRegister::CloseWait => {
+                send_sock_command(block, trans, SocketCommand::Disconnect)?;
+                self.status = SocketStatus::Closing;
+
+                Ok(())
+            }
+
+            // Connection already fully torn down.
+            SocketStatusRegister::Closed => {
+                self.status = SocketStatus::Closed;
+
+                Ok(())
+            }
+
+            // Any other state is unexpected for an established socket.
+            _ => {
+                send_sock_command(block, trans, SocketCommand::Close)?;
+                self.status = SocketStatus::ClosingDueToError;
+
+                Err(Error::UnexpectedResponse)
+            }
+        }
     }
 
     fn handle_closing(&mut self, block: &BlockAddress, trans: &mut Trans) -> Result<(), Error> {
