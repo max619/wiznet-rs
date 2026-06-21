@@ -29,6 +29,7 @@ bitflags! {
 pub enum SocketStatus {
     Init,
 
+    Opening,
     Connecting,
     Established,
 

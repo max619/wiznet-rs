@@ -6,15 +6,21 @@ use crate::w6100::{
     socket_common::{
         SocketCommand, SocketInterrupt, SocketStatusRegister, clear_interrupts, get_interrupts,
         init_socket, is_command_pending, read_status, send_sock_command, set_dst_port,
-        set_ipv4_dst_addr,
+        set_ipv4_dst_addr, set_src_port,
     },
     tcp_socket::TcpMode::{Connect, Listen},
     transiver::{Address, BlockAddress, Transceiver},
 };
 
 enum TcpMode {
-    Connect(u32, u16),
-    Listen(u16),
+    Connect {
+        dst_addr: u32,
+        dst_port: u16,
+        src_port: u16,
+    },
+    Listen {
+        src_port: u16,
+    },
 }
 
 pub struct TcpSocket<'a, Trans: Transceiver> {
@@ -30,9 +36,19 @@ pub struct TcpSocket<'a, Trans: Transceiver> {
 }
 
 impl<'a, Trans: Transceiver> TcpSocket<'a, Trans> {
-    pub fn connect(addr: u32, port: u16, rx_buffer: &'a mut [u8], tx_buffer: &'a mut [u8]) -> Self {
+    pub fn connect(
+        addr: u32,
+        port: u16,
+        src_port: u16,
+        rx_buffer: &'a mut [u8],
+        tx_buffer: &'a mut [u8],
+    ) -> Self {
         Self {
-            mode: Connect(addr, port),
+            mode: Connect {
+                dst_addr: addr,
+                dst_port: port,
+                src_port,
+            },
             status: SocketStatus::Init,
 
             rx_buffer,
@@ -46,7 +62,7 @@ impl<'a, Trans: Transceiver> TcpSocket<'a, Trans> {
 
     pub fn listen(port: u16, rx_buffer: &'a mut [u8], tx_buffer: &'a mut [u8]) -> Self {
         Self {
-            mode: Listen(port),
+            mode: Listen { src_port: port },
             status: SocketStatus::Init,
 
             rx_buffer,
@@ -86,32 +102,88 @@ impl<'a, Trans: Transceiver> TcpSocket<'a, Trans> {
         }
     }
 
+    /// Waiting for the `OPEN` command to move the socket into `SOCK_INIT`,
+    /// then issuing the protocol-specific command (`CONNECT`/`LISTEN`).
+    fn handle_opening(&mut self, block: &BlockAddress, trans: &mut Trans) -> Result<(), Error> {
+        // `OPEN` not processed yet.
+        if is_command_pending(block, trans)? {
+            return Ok(());
+        }
+
+        match read_status(block, trans)? {
+            SocketStatusRegister::Init => match &self.mode {
+                TcpMode::Connect {
+                    dst_addr, dst_port, ..
+                } => {
+                    set_ipv4_dst_addr(block, trans, *dst_addr)?;
+                    set_dst_port(block, trans, *dst_port)?;
+
+                    send_sock_command(block, trans, SocketCommand::Connect)?;
+                    self.status = SocketStatus::Connecting;
+
+                    Ok(())
+                }
+                TcpMode::Listen { .. } => {
+                    send_sock_command(block, trans, SocketCommand::Listen)?;
+                    self.status = SocketStatus::Listening;
+
+                    Ok(())
+                }
+            },
+
+            // Status register may lag a tick behind Sn_CR clearing; keep waiting.
+            SocketStatusRegister::Closed => Ok(()),
+
+            _ => {
+                send_sock_command(block, trans, SocketCommand::Close)?;
+                self.status = SocketStatus::ClosingDueToError;
+
+                Err(Error::UnexpectedResponse)
+            }
+        }
+    }
+
     fn handle_connecting(&mut self, block: &BlockAddress, trans: &mut Trans) -> Result<(), Error> {
         if is_command_pending(block, trans)? {
             return Ok(());
         }
 
-        let status = read_status(block, trans)?;
-        if &status == &SocketStatusRegister::Established {
-            self.status = SocketStatus::Established;
-            clear_interrupts(block, trans, SocketInterrupt::CON)?;
-
-            return Ok(());
-        }
-
-        if &status == &SocketStatusRegister::TimeWait {
-            self.status = SocketStatus::Timeout;
+        // A connect timeout (ARP or SYN retries exhausted) is reported via the
+        // TIMEOUT interrupt; the socket then falls back to SOCK_CLOSED.
+        if get_interrupts(block, trans)?.contains(SocketInterrupt::TIMEOUT) {
             clear_interrupts(block, trans, SocketInterrupt::TIMEOUT)?;
 
+            send_sock_command(block, trans, SocketCommand::Close)?;
             self.status = SocketStatus::ClosingDueToTimeout;
 
             return Ok(());
         }
 
-        send_sock_command(block, trans, SocketCommand::Close)?;
-        self.status = SocketStatus::ClosingDueToError;
+        match read_status(block, trans)? {
+            SocketStatusRegister::Established => {
+                self.status = SocketStatus::Established;
+                clear_interrupts(block, trans, SocketInterrupt::CON)?;
 
-        Err(Error::UnexpectedResponse)
+                Ok(())
+            }
+
+            // Handshake still in flight.
+            SocketStatusRegister::Synsent | SocketStatusRegister::Init => Ok(()),
+
+            // Reset/refused before the timeout fired.
+            SocketStatusRegister::Closed => {
+                self.status = SocketStatus::Closed;
+
+                Ok(())
+            }
+
+            _ => {
+                send_sock_command(block, trans, SocketCommand::Close)?;
+                self.status = SocketStatus::ClosingDueToError;
+
+                Err(Error::UnexpectedResponse)
+            }
+        }
     }
 
     fn handle_established(&mut self, block: &BlockAddress, trans: &mut Trans) -> Result<(), Error> {
@@ -147,24 +219,16 @@ impl<'a, Trans: Transceiver> SocketInternal<'a, Trans> for TcpSocket<'a, Trans> 
         self.store_error(|me| {
             init_socket(block, trans, SocketProtocolMode::TCP4)?;
 
-            match &me.mode {
-                TcpMode::Connect(addr, port) => {
-                    set_ipv4_dst_addr(block, trans, *addr)?;
-                    set_dst_port(block, trans, *port)?;
+            // The source port must be set before OPEN; CONNECT/LISTEN are only
+            // valid once the socket has reached SOCK_INIT.
+            let src_port = match &me.mode {
+                TcpMode::Connect { src_port, .. } => *src_port,
+                TcpMode::Listen { src_port } => *src_port,
+            };
+            set_src_port(block, trans, src_port)?;
 
-                    send_sock_command(block, trans, SocketCommand::Connect)?;
-
-                    me.status = SocketStatus::Connecting;
-                }
-
-                TcpMode::Listen(port) => {
-                    set_dst_port(block, trans, *port)?;
-
-                    send_sock_command(block, trans, SocketCommand::Listen)?;
-
-                    me.status = SocketStatus::Listening;
-                }
-            }
+            send_sock_command(block, trans, SocketCommand::Open)?;
+            me.status = SocketStatus::Opening;
 
             Ok(())
         })
@@ -172,6 +236,7 @@ impl<'a, Trans: Transceiver> SocketInternal<'a, Trans> for TcpSocket<'a, Trans> 
 
     fn run(&mut self, block: &BlockAddress, trans: &mut Trans) -> Result<(), Error> {
         self.store_error(|me| match &me.status {
+            SocketStatus::Opening => me.handle_opening(block, trans),
             SocketStatus::Connecting => me.handle_connecting(block, trans),
             SocketStatus::Established => me.handle_established(block, trans),
             SocketStatus::Listening => todo!(),

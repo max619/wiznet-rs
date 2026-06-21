@@ -63,7 +63,13 @@ fn main() -> ! {
     let mut rx = [0u8; 512];
     let mut tx = [0u8; 512];
 
-    let mut sock = TcpSocket::connect(u32::from_be_bytes([192, 168, 10, 1]), 80, &mut rx, &mut tx);
+    let mut sock = TcpSocket::connect(
+        u32::from_be_bytes([192, 168, 10, 1]),
+        80,
+        50000,
+        &mut rx,
+        &mut tx,
+    );
     let pinned_sock = PinnedSocket::pin(&mut sock);
 
     // Wait for the timer to trigger an update and change the state of the LED

@@ -326,6 +326,20 @@ pub(crate) fn clear_interrupts<Trans: Transceiver>(
     )
 }
 
+pub(crate) fn set_src_port<Trans: Transceiver>(
+    block: &BlockAddress,
+    trans: &mut Trans,
+    port: u16,
+) -> Result<(), Error> {
+    trans.write_u16(
+        &Address {
+            address: SN_PORTR0,
+            block: block.reg,
+        },
+        port,
+    )
+}
+
 pub(crate) fn set_dst_port<Trans: Transceiver>(
     block: &BlockAddress,
     trans: &mut Trans,
