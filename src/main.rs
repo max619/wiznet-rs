@@ -3,20 +3,16 @@
 #![no_main]
 
 use cortex_m_rt::entry;
-use embedded_hal::delay::DelayNs;
-use embedded_hal_bus::spi::NoDelay;
-use nb::block;
 use panic_halt as _;
 use stm32f1xx_hal::{
-    pac::{self, SYST},
+    pac::{self},
     prelude::*,
     rcc, spi,
-    time::MicroSeconds,
-    timer::{SysDelay, Timer},
+    timer::Timer,
 };
 
 mod w6100;
-use crate::w6100::W6100;
+use crate::w6100::{TcpSocket, W6100};
 
 #[entry]
 fn main() -> ! {
@@ -64,6 +60,11 @@ fn main() -> ! {
     )
     .expect("Failed to init W6100");
 
+    let mut rx = [0u8; 512];
+    let mut tx = [0u8; 512];
+
+    let sock = TcpSocket::new(1000, &mut rx, &mut tx);
+
     // Wait for the timer to trigger an update and change the state of the LED
     loop {
         // Wait for link
@@ -81,6 +82,10 @@ fn main() -> ! {
                 chip.reset().unwrap();
                 break;
             }
+
+            chip.run().unwrap();
+
+            chip.open(&sock).unwrap();
         }
     }
 }
