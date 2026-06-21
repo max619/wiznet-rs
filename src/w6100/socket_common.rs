@@ -436,6 +436,60 @@ pub(crate) fn read_rx_buffer<Trans: Transceiver>(
     )
 }
 
+/// Free space (in bytes) currently available in the SOCKET's TX buffer.
+pub(crate) fn get_tx_free_size<Trans: Transceiver>(
+    block: &BlockAddress,
+    trans: &mut Trans,
+) -> Result<u16, Error> {
+    trans.read_u16(&Address {
+        address: SN_TX_FSR0,
+        block: block.reg,
+    })
+}
+
+/// Current TX write pointer (Sn_TX_WR) — a free-running 16-bit offset.
+pub(crate) fn get_tx_write_pointer<Trans: Transceiver>(
+    block: &BlockAddress,
+    trans: &mut Trans,
+) -> Result<u16, Error> {
+    trans.read_u16(&Address {
+        address: SN_TX_WR0,
+        block: block.reg,
+    })
+}
+
+/// Advance the TX write pointer (Sn_TX_WR) after staging data to send.
+pub(crate) fn set_tx_write_pointer<Trans: Transceiver>(
+    block: &BlockAddress,
+    trans: &mut Trans,
+    pointer: u16,
+) -> Result<(), Error> {
+    trans.write_u16(
+        &Address {
+            address: SN_TX_WR0,
+            block: block.reg,
+        },
+        pointer,
+    )
+}
+
+/// Burst-write `data.len()` bytes into the SOCKET's TX buffer starting at the
+/// given pointer. The chip auto-increments and wraps within the buffer region.
+pub(crate) fn write_tx_buffer<Trans: Transceiver>(
+    block: &BlockAddress,
+    trans: &mut Trans,
+    pointer: u16,
+    data: &[u8],
+) -> Result<(), Error> {
+    trans.write(
+        &Address {
+            address: pointer,
+            block: block.tx,
+        },
+        data,
+    )
+}
+
 pub(crate) fn is_command_pending<Trans: Transceiver>(
     block: &BlockAddress,
     trans: &mut Trans,

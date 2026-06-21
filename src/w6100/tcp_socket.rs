@@ -6,9 +6,10 @@ use crate::w6100::{
     ring_buffer::RingBuffer,
     socket_common::{
         SocketCommand, SocketInterrupt, SocketStatusRegister, clear_interrupts, get_interrupts,
-        get_rx_read_pointer, get_rx_received_size, init_socket, is_command_pending, read_rx_buffer,
-        read_status, send_sock_command, set_dst_port, set_ipv4_dst_addr, set_rx_read_pointer,
-        set_src_port,
+        get_rx_read_pointer, get_rx_received_size, get_tx_free_size, get_tx_write_pointer,
+        init_socket, is_command_pending, read_rx_buffer, read_status, send_sock_command,
+        set_dst_port, set_ipv4_dst_addr, set_rx_read_pointer, set_src_port, set_tx_write_pointer,
+        write_tx_buffer,
     },
     tcp_socket::TcpMode::{Connect, Listen},
     transiver::{Address, BlockAddress, Transceiver},
@@ -82,6 +83,14 @@ impl<'a, Trans: Transceiver> TcpSocket<'a, Trans> {
     /// pulled off the chip.
     pub fn read(&mut self, dst: &mut [u8]) -> usize {
         self.rx_buffer.read(dst)
+    }
+
+    /// Queue up to `src.len()` bytes for transmission, returning the number
+    /// accepted into the local tx ring (limited by its free space). Non-blocking:
+    /// the staged data is pushed onto the chip and sent by
+    /// [`run`](SocketInternal::run).
+    pub fn write(&mut self, src: &[u8]) -> usize {
+        self.tx_buffer.write(src)
     }
 
     fn raise_pending_error(&mut self) -> Result<(), Error> {
@@ -239,6 +248,49 @@ impl<'a, Trans: Transceiver> TcpSocket<'a, Trans> {
         Ok(available - to_read)
     }
 
+    /// Push data staged in the local tx ring into the chip's TX buffer and
+    /// kick off transmission, limited by the room available on the chip.
+    /// Anything that doesn't fit stays in the ring for a later tick. Non-blocking.
+    ///
+    /// Returns the number of bytes still queued in the local tx ring after this
+    /// pass (non-zero only when the chip's TX buffer filled up). A return of `0`
+    /// means everything staged has been handed to the chip.
+    fn transmit(&mut self, block: &BlockAddress, trans: &mut Trans) -> Result<usize, Error> {
+        let pending = self.tx_buffer.len();
+        if pending == 0 {
+            return Ok(0);
+        }
+
+        let free = get_tx_free_size(block, trans)? as usize;
+        let to_send = core::cmp::min(pending, free);
+        if to_send == 0 {
+            // Chip TX buffer is full; leave the data staged and retry later.
+            return Ok(pending);
+        }
+
+        // The local ring may wrap, so copy out in up to two contiguous chunks.
+        // The chip auto-advances/wraps its own buffer, so we just keep stepping
+        // the write pointer by the amount staged.
+        let mut pointer = get_tx_write_pointer(block, trans)?;
+        let mut remaining = to_send;
+        while remaining > 0 {
+            let region = self.tx_buffer.readable();
+            let n = core::cmp::min(region.len(), remaining);
+
+            write_tx_buffer(block, trans, pointer, &region[..n])?;
+            self.tx_buffer.advance_read(n);
+
+            pointer = pointer.wrapping_add(n as u16);
+            remaining -= n;
+        }
+
+        // Commit the new write pointer and tell the chip to send.
+        set_tx_write_pointer(block, trans, pointer)?;
+        send_sock_command(block, trans, SocketCommand::Send)?;
+
+        Ok(pending - to_send)
+    }
+
     /// Idle health-check for an established connection: watch for the failure
     /// and teardown conditions that can occur while we are not actively
     /// sending or receiving.
@@ -263,9 +315,11 @@ impl<'a, Trans: Transceiver> TcpSocket<'a, Trans> {
         }
 
         match read_status(block, trans)? {
-            // Still connected and healthy — pull down any pending data.
+            // Still connected and healthy — pull down any pending data and push
+            // out anything we have staged to send.
             SocketStatusRegister::Established => {
                 self.receive(block, trans)?;
+                self.transmit(block, trans)?;
 
                 Ok(())
             }

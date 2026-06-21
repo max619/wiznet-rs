@@ -2,6 +2,8 @@
 #![no_std]
 #![no_main]
 
+use core::ptr::read;
+
 use cortex_m_rt::entry;
 use panic_halt as _;
 use stm32f1xx_hal::{
@@ -12,7 +14,7 @@ use stm32f1xx_hal::{
 };
 
 mod w6100;
-use crate::w6100::{PinnedSocket, TcpSocket, W6100};
+use crate::w6100::{PinnedSocket, SocketStatus, TcpSocket, UserSocket, W6100};
 
 #[entry]
 fn main() -> ! {
@@ -64,8 +66,8 @@ fn main() -> ! {
     let mut tx = [0u8; 512];
 
     let mut sock = TcpSocket::connect(
-        u32::from_be_bytes([192, 168, 10, 1]),
-        80,
+        u32::from_be_bytes([192, 168, 10, 148]),
+        5555,
         50000,
         &mut rx,
         &mut tx,
@@ -93,6 +95,17 @@ fn main() -> ! {
             }
 
             chip.run().unwrap();
+
+            let mut recv_buff = [0u8; 16];
+
+            {
+                let mut locked_sock = pinned_sock.lock_mut().unwrap();
+
+                if locked_sock.as_mut().get_status() == SocketStatus::Established {
+                    let read_bytes = locked_sock.as_mut().read(&mut recv_buff);
+                    locked_sock.as_mut().write(&recv_buff[0..read_bytes]);
+                }
+            };
         }
     }
 }

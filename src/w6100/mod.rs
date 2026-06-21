@@ -20,7 +20,7 @@ mod transiver;
 use self::transiver::{Address, BlockSelectionBits, Transceiver};
 
 mod socket;
-pub use socket::PinnedSocket;
+pub use socket::{PinnedSocket, SocketStatus, UserSocket};
 
 mod socket_common;
 

@@ -62,6 +62,51 @@ impl<'a> RingBuffer<'a> {
         self.len += n;
     }
 
+    /// Copy up to `src.len()` bytes into the buffer, returning the number
+    /// actually stored (which is `min(src.len(), self.free())`).
+    pub(crate) fn write(&mut self, src: &[u8]) -> usize {
+        let cap = self.capacity();
+        let mut written = 0;
+
+        while written < src.len() && self.len < cap {
+            let tail = (self.head + self.len) % cap;
+            // Length of the contiguous free run starting at `tail`.
+            let run = core::cmp::min(cap - self.len, cap - tail);
+            let n = core::cmp::min(run, src.len() - written);
+
+            self.buf[tail..tail + n].copy_from_slice(&src[written..written + n]);
+
+            self.len += n;
+            written += n;
+        }
+
+        written
+    }
+
+    /// The largest contiguous run of stored data available for reading right
+    /// now. Because the buffer wraps, this may be shorter than [`len`](Self::len);
+    /// call repeatedly (with [`advance_read`](Self::advance_read) in between) to
+    /// drain the rest.
+    pub(crate) fn readable(&self) -> &[u8] {
+        if self.len == 0 {
+            return &self.buf[0..0];
+        }
+
+        let cap = self.capacity();
+        let run = core::cmp::min(self.len, cap - self.head);
+
+        &self.buf[self.head..self.head + run]
+    }
+
+    /// Discard `n` bytes previously taken from the [`readable`](Self::readable)
+    /// region. `n` must not exceed that region's length.
+    pub(crate) fn advance_read(&mut self, n: usize) {
+        debug_assert!(n <= self.len);
+        let cap = self.capacity();
+        self.head = (self.head + n) % cap;
+        self.len -= n;
+    }
+
     /// Copy out up to `dst.len()` bytes, returning the number actually copied
     /// (which is `min(dst.len(), self.len())`).
     pub(crate) fn read(&mut self, dst: &mut [u8]) -> usize {
