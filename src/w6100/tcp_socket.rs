@@ -37,6 +37,10 @@ pub(crate) struct TcpSocketState<'a> {
     tx_buffer: RingBuffer<'a>,
 
     pending_error: Option<Error>,
+
+    /// Set by the handle's `close`; acted on by the next `run` tick (which has
+    /// chip access).
+    close_requested: bool,
 }
 
 impl<'a> TcpSocketState<'a> {
@@ -59,6 +63,8 @@ impl<'a> TcpSocketState<'a> {
             tx_buffer: RingBuffer::new(tx_buffer),
 
             pending_error: None,
+
+            close_requested: false,
         }
     }
 
@@ -71,6 +77,8 @@ impl<'a> TcpSocketState<'a> {
             tx_buffer: RingBuffer::new(tx_buffer),
 
             pending_error: None,
+
+            close_requested: false,
         }
     }
 
@@ -97,6 +105,12 @@ impl<'a> TcpSocketState<'a> {
     pub(crate) fn rearm(&mut self) {
         self.status = SocketStatus::Init;
         self.pending_error = None;
+        self.close_requested = false;
+    }
+
+    /// Request a graceful close on the next `run` tick.
+    pub(crate) fn request_close(&mut self) {
+        self.close_requested = true;
     }
 
     fn store_error<F: FnMut(&mut Self) -> Result<(), Error>>(
@@ -112,6 +126,51 @@ impl<'a> TcpSocketState<'a> {
                     Ok(())
                 }
             },
+        }
+    }
+
+    /// Act on a pending close request. For a live connection this sends a
+    /// graceful FIN (`DISCON`) after one best-effort flush of staged tx data;
+    /// for a socket still coming up it aborts with `CLOSE`. Either way we land
+    /// in a closing state and the existing teardown machinery finishes the job.
+    fn handle_close<T: Transceiver>(
+        &mut self,
+        block: &BlockAddress,
+        trans: &mut T,
+    ) -> Result<(), Error> {
+        self.close_requested = false;
+
+        match self.status {
+            // Nothing live to tear down.
+            SocketStatus::Closed
+            | SocketStatus::Error
+            | SocketStatus::Timeout
+            | SocketStatus::ClosingDueToError
+            | SocketStatus::ClosingDueToTimeout
+            | SocketStatus::Closing => Ok(()),
+
+            // Graceful shutdown of an established connection. Best-effort flush
+            // (bounded: a single pass) so already-staged bytes go out ahead of
+            // the FIN; anything that doesn't fit on the chip is dropped.
+            SocketStatus::Established => {
+                self.transmit(block, trans)?;
+
+                send_sock_command(block, trans, SocketCommand::Disconnect)?;
+                self.status = SocketStatus::Closing;
+
+                Ok(())
+            }
+
+            // Abort a socket that is still opening/connecting/listening.
+            SocketStatus::Init
+            | SocketStatus::Opening
+            | SocketStatus::Connecting
+            | SocketStatus::Listening => {
+                send_sock_command(block, trans, SocketCommand::Close)?;
+                self.status = SocketStatus::Closing;
+
+                Ok(())
+            }
         }
     }
 
@@ -459,17 +518,23 @@ impl<'a> TcpSocketState<'a> {
         block: &BlockAddress,
         trans: &mut T,
     ) -> Result<(), Error> {
-        self.store_error(|me| match me.status {
-            SocketStatus::Init => me.handle_init(block, trans),
-            SocketStatus::Opening => me.handle_opening(block, trans),
-            SocketStatus::Connecting => me.handle_connecting(block, trans),
-            SocketStatus::Established => me.handle_established(block, trans),
-            SocketStatus::Listening => me.handle_listening(block, trans),
-            SocketStatus::ClosingDueToError
-            | SocketStatus::ClosingDueToTimeout
-            | SocketStatus::Closing => me.handle_closing(block, trans),
+        self.store_error(|me| {
+            if me.close_requested {
+                return me.handle_close(block, trans);
+            }
 
-            SocketStatus::Timeout | SocketStatus::Closed | SocketStatus::Error => Ok(()),
+            match me.status {
+                SocketStatus::Init => me.handle_init(block, trans),
+                SocketStatus::Opening => me.handle_opening(block, trans),
+                SocketStatus::Connecting => me.handle_connecting(block, trans),
+                SocketStatus::Established => me.handle_established(block, trans),
+                SocketStatus::Listening => me.handle_listening(block, trans),
+                SocketStatus::ClosingDueToError
+                | SocketStatus::ClosingDueToTimeout
+                | SocketStatus::Closing => me.handle_closing(block, trans),
+
+                SocketStatus::Timeout | SocketStatus::Closed | SocketStatus::Error => Ok(()),
+            }
         })
     }
 }
@@ -516,6 +581,19 @@ impl<'a> TcpSocket<'a> {
             Some(tcp) => tcp.status(),
             None => SocketStatus::Closed,
         })
+    }
+
+    /// Request a graceful close of the connection. Non-blocking: the FIN is sent
+    /// by the next `W6100::run` tick and the teardown completes asynchronously;
+    /// poll [`status`](Self::status) for `Closed` to confirm.
+    pub fn close(&self) -> Result<(), Error> {
+        let mut guard = self.backend.lock_mut()?;
+
+        if let Some(tcp) = guard.as_mut().as_tcp_mut() {
+            tcp.request_close();
+        }
+
+        Ok(())
     }
 
     /// Re-arm the socket so `W6100::run` re-opens and reconnects it. Use after a
