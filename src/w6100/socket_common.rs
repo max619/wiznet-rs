@@ -427,7 +427,7 @@ pub(crate) fn read_rx_buffer<Trans: Transceiver>(
     pointer: u16,
     data: &mut [u8],
 ) -> Result<(), Error> {
-    trans.read(
+    trans.bulk_read(
         &Address {
             address: pointer,
             block: block.rx,
@@ -481,7 +481,7 @@ pub(crate) fn write_tx_buffer<Trans: Transceiver>(
     pointer: u16,
     data: &[u8],
 ) -> Result<(), Error> {
-    trans.write(
+    trans.bulk_write(
         &Address {
             address: pointer,
             block: block.tx,

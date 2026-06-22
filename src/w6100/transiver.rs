@@ -48,6 +48,37 @@ pub struct Address {
     pub(crate) block: BlockSelectionBits,
 }
 
+/// Build the 3-byte W6100 SPI command header for `addr`. `write` selects the
+/// RWB bit; OM is left 0 (variable-length mode).
+pub(crate) fn header(addr: &Address, write: bool) -> [u8; 3] {
+    let mut h = [0u8; 3];
+    h[0..2].copy_from_slice(&addr.address.to_be_bytes());
+    h[2] = ((addr.block as u8) << 3) | if write { 0b100 } else { 0 };
+    h
+}
+
+/// Async DMA capability for the SPI link, kept deliberately platform-close: it
+/// moves an opaque `header` (clocked out blocking) plus a DMA payload, manages
+/// CS across the transfer, and owns its own scratch. No W6100 concepts here.
+///
+/// Completion is signalled out-of-band (the platform's DMA interrupt), after
+/// which [`finish`](Self::finish) reclaims the bus.
+pub trait SpiDma {
+    /// Clock out `header`, then DMA-read `len` payload bytes into internal scratch.
+    fn start_read(&mut self, header: &[u8], len: usize) -> Result<(), Error>;
+
+    /// Clock out `header`, then DMA-write `data` (copied internally before return).
+    fn start_write(&mut self, header: &[u8], data: &[u8]) -> Result<(), Error>;
+
+    /// Wait for the in-flight transfer to finish (instant when called from the
+    /// completion interrupt), release CS, and free the bus. No-op if idle.
+    fn finish(&mut self) -> Result<(), Error>;
+
+    /// The payload captured by the most recent [`start_read`](Self::start_read),
+    /// valid once [`finish`](Self::finish) has run.
+    fn read_buffer(&self) -> &[u8];
+}
+
 macro_rules! impl_read_primitive {
     ($name:ident, $t:ty) => {
         fn $name(&mut self, addr: &Address) -> Result<$t, Error> {
@@ -72,6 +103,14 @@ pub trait Transceiver {
     fn read(&mut self, addr: &Address, data: &mut [u8]) -> Result<(), Error>;
 
     fn write(&mut self, addr: &Address, data: &[u8]) -> Result<(), Error>;
+
+    /// Bulk read via DMA (blocking for now): frames the header and moves the
+    /// payload through the [`SpiDma`] path into `dst`.
+    fn bulk_read(&mut self, addr: &Address, dst: &mut [u8]) -> Result<(), Error>;
+
+    /// Bulk write via DMA (blocking for now): frames the header and moves `data`
+    /// through the [`SpiDma`] path.
+    fn bulk_write(&mut self, addr: &Address, data: &[u8]) -> Result<(), Error>;
 
     impl_read_primitive!(read_u8, u8);
     impl_read_primitive!(read_u16, u16);

@@ -14,19 +14,18 @@ use stm32f1xx_hal::{
     pac::{self, interrupt},
     prelude::*,
     rcc, spi,
-    spi::Spi,
-    timer::{CounterHz, Event, SysDelay, Timer},
+    timer::{CounterHz, Event},
 };
 
+mod hal_spi;
 mod w6100;
+use crate::hal_spi::{HalSpi, SCRATCH};
 use crate::w6100::{NetworkConfig, SocketStatus, TcpSocket, W6100};
 
 // Concrete types of the fully-configured chip, needed to name the `'static`
 // singleton storage and the interrupt-shared globals.
-type ChipSpi =
-    embedded_hal_bus::spi::ExclusiveDevice<Spi<pac::SPI1, u8>, Pin<'A', 9, Output>, SysDelay>;
 type ChipRst = Pin<'A', 8, Output>;
-type Chip = W6100<'static, ChipSpi, ChipRst>;
+type Chip = W6100<'static, HalSpi, ChipRst>;
 
 // Shared with the interrupt handlers. The chip is only ever touched through
 // `&self`, so a shared `&'static` reference is all the ISRs need; the timer and
@@ -38,7 +37,6 @@ static INT_PIN: Mutex<RefCell<Option<Pin<'A', 10, Input<PullUp>>>>> =
 
 #[entry]
 fn main() -> ! {
-    let cp = cortex_m::Peripherals::take().unwrap();
     let dp = pac::Peripherals::take().unwrap();
 
     let mut flash = dp.FLASH.constrain();
@@ -78,6 +76,10 @@ fn main() -> ! {
         &mut rcc,
     );
 
+    // DMA1: channel 2 = SPI1_RX, channel 3 = SPI1_TX.
+    let dma1 = dp.DMA1.split(&mut rcc);
+    let sysclk_hz = rcc.clocks.sysclk().raw();
+
     let mac = [0xfc, 0xd7, 0xfd, 0xab, 0x8b, 0xe4];
 
     // Buffers and the chip itself live for the whole program in `static` storage
@@ -85,19 +87,21 @@ fn main() -> ! {
     static CHIP_CELL: StaticCell<Chip> = StaticCell::new();
     static RX: StaticCell<[u8; 512]> = StaticCell::new();
     static TX: StaticCell<[u8; 512]> = StaticCell::new();
+    static RX_SCRATCH: StaticCell<[u8; SCRATCH]> = StaticCell::new();
+    static TX_SCRATCH: StaticCell<[u8; SCRATCH]> = StaticCell::new();
+
+    let hal_spi = HalSpi::new(
+        spi,
+        dma1.2,
+        dma1.3,
+        cs,
+        RX_SCRATCH.init([0u8; SCRATCH]),
+        TX_SCRATCH.init([0u8; SCRATCH]),
+        sysclk_hz,
+    );
 
     let chip: &'static Chip = CHIP_CELL.init(
-        W6100::new(
-            embedded_hal_bus::spi::ExclusiveDevice::new(
-                spi,
-                cs,
-                Timer::syst(cp.SYST, &rcc.clocks).delay(),
-            )
-            .expect("Failed to create exclusive device"),
-            rst,
-            mac,
-        )
-        .expect("Failed to init W6100"),
+        W6100::new(hal_spi, rst, mac).expect("Failed to init W6100"),
     );
 
     // Periodic 1 ms tick: drives the non-interrupt transitions (handshake/close

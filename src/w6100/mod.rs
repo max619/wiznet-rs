@@ -10,7 +10,8 @@ mod atomic_cell;
 use self::atomic_cell::{AtomicCell, AtomicError, AtomicMutLock};
 
 mod transiver;
-use self::transiver::{Address, BlockAddress, BlockSelectionBits, Transceiver};
+pub use self::transiver::SpiDma;
+use self::transiver::{Address, BlockAddress, BlockSelectionBits, Transceiver, header};
 
 mod socket;
 pub use self::socket::SocketStatus;
@@ -145,7 +146,7 @@ pub struct NetworkConfig {
     pub subnet: u32,
 }
 
-pub struct W6100<'a, Spi: SpiDevice<u8>, RstPin: OutputPin> {
+pub struct W6100<'a, Spi: SpiDevice<u8> + SpiDma, RstPin: OutputPin> {
     device: AtomicCell<Device<Spi, RstPin>>,
     mac: MacAddress,
 
@@ -174,28 +175,34 @@ impl From<AtomicError> for Error {
     }
 }
 
-impl<Spi: SpiDevice<u8>> Transceiver for Transport<Spi> {
+impl<Spi: SpiDevice<u8> + SpiDma> Transceiver for Transport<Spi> {
     fn read(&mut self, addr: &Address, data: &mut [u8]) -> Result<(), Error> {
-        let mut buf = [0u8; 3];
-
-        buf[0..2].copy_from_slice(&addr.address.to_be_bytes());
-        buf[2] = (addr.block as u8) << 3;
-
         self.spi
-            .transaction(&mut [Operation::Write(&buf), Operation::Read(data)])
+            .transaction(&mut [Operation::Write(&header(addr, false)), Operation::Read(data)])
             .map_err(|_| Error::SpiError)
     }
 
     fn write(&mut self, addr: &Address, data: &[u8]) -> Result<(), Error> {
-        let mut buf = [0u8; 3];
-
-        buf[0..2].copy_from_slice(&addr.address.to_be_bytes());
-        // RWB (bit 2) = 1 selects write; OM (bits 1:0) = 00 = VDM.
-        buf[2] = (addr.block as u8) << 3 | 0b100;
-
         self.spi
-            .transaction(&mut [Operation::Write(&buf), Operation::Write(data)])
+            .transaction(&mut [Operation::Write(&header(addr, true)), Operation::Write(data)])
             .map_err(|_| Error::SpiError)
+    }
+
+    fn bulk_read(&mut self, addr: &Address, dst: &mut [u8]) -> Result<(), Error> {
+        // Blocking for now: kick off the DMA read and immediately wait. Phase 2
+        // moves the `finish` to the completion interrupt.
+        self.spi.start_read(&header(addr, false), dst.len())?;
+        self.spi.finish()?;
+
+        let received = self.spi.read_buffer();
+        dst.copy_from_slice(&received[..dst.len()]);
+
+        Ok(())
+    }
+
+    fn bulk_write(&mut self, addr: &Address, data: &[u8]) -> Result<(), Error> {
+        self.spi.start_write(&header(addr, true), data)?;
+        self.spi.finish()
     }
 }
 
@@ -208,7 +215,7 @@ fn backend_cell<'a>(
     AtomicCell::new(SocketBackend::new(BlockAddress { reg, tx, rx }))
 }
 
-impl<'a, Spi: SpiDevice<u8>, RstPin: OutputPin> W6100<'a, Spi, RstPin> {
+impl<'a, Spi: SpiDevice<u8> + SpiDma, RstPin: OutputPin> W6100<'a, Spi, RstPin> {
     pub fn new(spi: Spi, rst: RstPin, mac: MacAddress) -> Result<Self, Error> {
         let this = W6100 {
             device: AtomicCell::new(Device {
