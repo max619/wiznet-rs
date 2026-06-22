@@ -2,25 +2,43 @@
 #![no_std]
 #![no_main]
 
-use core::ptr::read;
+use core::cell::{Cell, RefCell};
 
+use cortex_m::interrupt::{Mutex, free as interrupt_free};
+use cortex_m::peripheral::NVIC;
 use cortex_m_rt::entry;
 use panic_halt as _;
+use static_cell::StaticCell;
 use stm32f1xx_hal::{
-    pac::{self},
+    gpio::{Edge, ExtiPin, Input, Output, Pin, PullUp},
+    pac::{self, interrupt},
     prelude::*,
     rcc, spi,
-    timer::Timer,
+    spi::Spi,
+    timer::{CounterHz, Event, SysDelay, Timer},
 };
 
 mod w6100;
-use crate::w6100::{SocketStatus, W6100};
+use crate::w6100::{NetworkConfig, SocketStatus, TcpSocket, W6100};
+
+// Concrete types of the fully-configured chip, needed to name the `'static`
+// singleton storage and the interrupt-shared globals.
+type ChipSpi =
+    embedded_hal_bus::spi::ExclusiveDevice<Spi<pac::SPI1, u8>, Pin<'A', 9, Output>, SysDelay>;
+type ChipRst = Pin<'A', 8, Output>;
+type Chip = W6100<'static, ChipSpi, ChipRst>;
+
+// Shared with the interrupt handlers. The chip is only ever touched through
+// `&self`, so a shared `&'static` reference is all the ISRs need; the timer and
+// INT pin are owned so the ISRs can clear their pending flags.
+static CHIP: Mutex<Cell<Option<&'static Chip>>> = Mutex::new(Cell::new(None));
+static TIMER: Mutex<RefCell<Option<CounterHz<pac::TIM2>>>> = Mutex::new(RefCell::new(None));
+static INT_PIN: Mutex<RefCell<Option<Pin<'A', 10, Input<PullUp>>>>> =
+    Mutex::new(RefCell::new(None));
 
 #[entry]
 fn main() -> ! {
-    // Get access to the core peripherals from the cortex-m crate
     let cp = cortex_m::Peripherals::take().unwrap();
-    // Get access to the device specific peripherals from the peripheral access crate
     let dp = pac::Peripherals::take().unwrap();
 
     let mut flash = dp.FLASH.constrain();
@@ -29,19 +47,31 @@ fn main() -> ! {
         &mut flash.acr,
     );
 
-    let mut gpio_a = dp.GPIOA.split(&mut rcc);
+    let mut afio = dp.AFIO.constrain(&mut rcc);
+    let mut exti = dp.EXTI;
 
-    let mut rst = gpio_a.pa8.into_push_pull_output(&mut gpio_a.crh);
-    let mut cs: stm32f1xx_hal::gpio::Pin<'A', 9, stm32f1xx_hal::gpio::Output> =
-        gpio_a.pa9.into_push_pull_output(&mut gpio_a.crh);
-    let mut interrupt = gpio_a.pa10.into_pull_up_input(&mut gpio_a.crh);
+    let mut gpio_a = dp.GPIOA.split(&mut rcc);
+    let mut gpio_c = dp.GPIOC.split(&mut rcc);
+
+    // Onboard LED on PC13 (active low): lit while the socket is connected.
+    let mut led = gpio_c.pc13.into_push_pull_output(&mut gpio_c.crh);
+    led.set_high(); // off
+
+    let rst = gpio_a.pa8.into_push_pull_output(&mut gpio_a.crh);
+    let cs: Pin<'A', 9, Output> = gpio_a.pa9.into_push_pull_output(&mut gpio_a.crh);
+
+    // W6100 INT line (active low) -> EXTI line 10, falling edge.
+    let mut int_pin = gpio_a.pa10.into_pull_up_input(&mut gpio_a.crh);
+    int_pin.make_interrupt_source(&mut afio);
+    int_pin.trigger_on_edge(&mut exti, Edge::Falling);
+    int_pin.enable_interrupt(&mut exti);
 
     let spi_mode = spi::Mode {
         polarity: spi::Polarity::IdleLow,
         phase: spi::Phase::CaptureOnFirstTransition,
     };
 
-    let mut spi = dp.SPI1.spi(
+    let spi = dp.SPI1.spi(
         (Some(gpio_a.pa5), Some(gpio_a.pa6), Some(gpio_a.pa7)),
         spi_mode,
         1.MHz(),
@@ -50,65 +80,150 @@ fn main() -> ! {
 
     let mac = [0xfc, 0xd7, 0xfd, 0xab, 0x8b, 0xe4];
 
-    // Declared before the chip so they outlive the handle's borrow of it.
-    let mut rx = [0u8; 512];
-    let mut tx = [0u8; 512];
+    // Buffers and the chip itself live for the whole program in `static` storage
+    // so the interrupt handlers can reach the chip via `&'static`.
+    static CHIP_CELL: StaticCell<Chip> = StaticCell::new();
+    static RX: StaticCell<[u8; 512]> = StaticCell::new();
+    static TX: StaticCell<[u8; 512]> = StaticCell::new();
 
-    let chip = W6100::new(
-        embedded_hal_bus::spi::ExclusiveDevice::new(
-            spi,
-            cs,
-            Timer::syst(cp.SYST, &rcc.clocks).delay(),
+    let chip: &'static Chip = CHIP_CELL.init(
+        W6100::new(
+            embedded_hal_bus::spi::ExclusiveDevice::new(
+                spi,
+                cs,
+                Timer::syst(cp.SYST, &rcc.clocks).delay(),
+            )
+            .expect("Failed to create exclusive device"),
+            rst,
+            mac,
         )
-        .expect("Failed to create exclusive device"),
-        rst,
-        mac,
-    )
-    .expect("Failed to init W6100");
+        .expect("Failed to init W6100"),
+    );
 
-    // Echo server: listen on TCP port 5555 and bounce back whatever arrives.
-    let sock = chip
-        .open_tcp_listen(5555, &mut rx, &mut tx)
-        .expect("Failed to open socket");
+    // Periodic 1 ms tick: drives the non-interrupt transitions (handshake/close
+    // polling, TX flush) and backstops any missed INT edge.
+    let mut timer = dp.TIM2.counter_hz(&mut rcc);
+    timer.start(1.kHz()).unwrap();
+    timer.listen(Event::Update);
+
+    // Publish the chip and the interrupt-owned peripherals, then let the ISRs run.
+    interrupt_free(|cs| {
+        CHIP.borrow(cs).set(Some(chip));
+        TIMER.borrow(cs).replace(Some(timer));
+        INT_PIN.borrow(cs).replace(Some(int_pin));
+    });
+
+    #[allow(unsafe_code)]
+    // SAFETY: enabling the chip's servicing interrupts; nothing relies on these
+    // being masked for a critical section.
+    unsafe {
+        NVIC::unmask(pac::Interrupt::TIM2);
+        NVIC::unmask(pac::Interrupt::EXTI15_10);
+    }
+
+    // Application thread: no SPI, just react to the socket and sleep. All chip
+    // I/O happens in `service` on the interrupts. Handle ops can transiently
+    // return `Err(Busy)` if an ISR is mid-servicing the socket — just retry.
+    //
+    // The 'static buffers can only be handed out once, so the listener is opened
+    // on the first link-up and re-armed (not re-created) on later ones.
+    let mut socket: Option<TcpSocket<'static>> = None;
 
     loop {
-        // Wait for link
-        while !chip.is_link_up().unwrap() {}
+        // Phase 1: wait for the link to really come up (per the cached link
+        // state `service` maintains), sleeping until then.
+        while !chip.link_up() {
+            cortex_m::asm::wfi();
+        }
 
-        chip.setup_network(
-            u32::from_be_bytes([192, 168, 10, 10]),
-            u32::from_be_bytes([192, 168, 10, 1]),
-            u32::from_be_bytes([255, 255, 255, 0]),
-        )
-        .unwrap();
+        // Phase 2: link is up — apply addressing and bring the listener up. Both
+        // are SPI-free; `service` applies them on its next tick.
+        chip.set_network_config(NetworkConfig {
+            ip: u32::from_be_bytes([192, 168, 10, 10]),
+            gateway: u32::from_be_bytes([192, 168, 10, 1]),
+            subnet: u32::from_be_bytes([255, 255, 255, 0]),
+        })
+        .expect("Failed to set network config");
 
-        // Re-arm the socket so `run` re-opens it and starts listening.
-        sock.reconnect().unwrap();
+        // Echo server: listen on TCP port 5555 and echo whatever arrives. Open
+        // the listener on the first link-up (already armed); on later link-ups
+        // re-arm the existing one instead of re-creating it.
+        if socket.is_none() {
+            socket = Some(
+                chip.open_tcp_listen(5555, RX.init([0u8; 512]), TX.init([0u8; 512]))
+                    .expect("Failed to open socket"),
+            );
+        } else {
+            socket
+                .as_ref()
+                .unwrap()
+                .reconnect()
+                .expect("Failed to re-arm socket");
+        }
 
-        loop {
-            if !chip.is_link_up().unwrap() {
-                chip.reset().unwrap();
-                break;
-            }
+        let sock = socket.as_ref().unwrap();
 
-            chip.run().unwrap();
+        // Phase 3: handle the connection until the link drops, then loop back to
+        // phase 1 and wait for it to return.
+        while chip.link_up() {
+            match sock.status() {
+                Ok(SocketStatus::Established) => {
+                    led.set_low(); // LED on while connected (active low)
 
-            match sock.status().unwrap() {
-                SocketStatus::Established => {
-                    let mut recv_buff = [0u8; 16];
-
-                    let read_bytes = sock.read(&mut recv_buff).unwrap();
-                    sock.write(&recv_buff[0..read_bytes]).unwrap();
+                    let mut buf = [0u8; 16];
+                    if let Ok(n) = sock.read(&mut buf) {
+                        if n > 0 {
+                            let _ = sock.write(&buf[..n]);
+                        }
+                    }
                 }
 
                 // Client disconnected (or the attempt failed); re-arm to accept
                 // the next connection.
-                SocketStatus::Closed | SocketStatus::Timeout | SocketStatus::Error => {
-                    sock.reconnect().unwrap();
+                Ok(SocketStatus::Closed) | Ok(SocketStatus::Timeout) | Ok(SocketStatus::Error) => {
+                    led.set_high(); // off
+                    let _ = sock.reconnect();
                 }
 
-                _ => {}
+                _ => led.set_high(), // off (listening/connecting/busy)
             }
+
+            cortex_m::asm::wfi();
         }
+
+        led.set_high(); // link dropped: off
     }
+}
+
+/// Run one background servicing step on the chip (all SPI work).
+fn service() {
+    let chip = interrupt_free(|cs| CHIP.borrow(cs).get());
+
+    if let Some(chip) = chip {
+        let _ = chip.service();
+    }
+}
+
+/// Periodic tick.
+#[interrupt]
+fn TIM2() {
+    interrupt_free(|cs| {
+        if let Some(timer) = TIMER.borrow(cs).borrow_mut().as_mut() {
+            timer.clear_interrupt(Event::Update);
+        }
+    });
+
+    service();
+}
+
+/// W6100 INT line — low-latency wake on chip events (RX, CON, DISCON, …).
+#[interrupt]
+fn EXTI15_10() {
+    interrupt_free(|cs| {
+        if let Some(pin) = INT_PIN.borrow(cs).borrow_mut().as_mut() {
+            pin.clear_interrupt_pending_bit();
+        }
+    });
+
+    service();
 }

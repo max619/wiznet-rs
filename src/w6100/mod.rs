@@ -1,3 +1,5 @@
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use bitflags::bitflags;
 use embedded_hal::{
     digital::OutputPin,
@@ -134,9 +136,24 @@ struct Device<Spi: SpiDevice<u8>, RstPin: OutputPin> {
     rst: RstPin,
 }
 
+/// IPv4 addressing applied to the chip. Set at runtime (statically by the
+/// application, or later by a DHCP client) rather than at initialization.
+#[derive(Clone, Copy)]
+pub struct NetworkConfig {
+    pub ip: u32,
+    pub gateway: u32,
+    pub subnet: u32,
+}
+
 pub struct W6100<'a, Spi: SpiDevice<u8>, RstPin: OutputPin> {
     device: AtomicCell<Device<Spi, RstPin>>,
     mac: MacAddress,
+
+    // Network addressing: `None` until provided at runtime. `service` (re)applies
+    // it to the chip whenever it is set or the link comes back up.
+    config: AtomicCell<Option<NetworkConfig>>,
+    config_dirty: AtomicBool,
+    link_up: AtomicBool,
 
     sockets: [AtomicCell<SocketBackend<'a>>; 8],
 }
@@ -199,6 +216,9 @@ impl<'a, Spi: SpiDevice<u8>, RstPin: OutputPin> W6100<'a, Spi, RstPin> {
                 rst,
             }),
             mac,
+            config: AtomicCell::new(None),
+            config_dirty: AtomicBool::new(false),
+            link_up: AtomicBool::new(false),
             sockets: [
                 backend_cell(
                     BlockSelectionBits::Socket0Register,
@@ -279,6 +299,9 @@ impl<'a, Spi: SpiDevice<u8>, RstPin: OutputPin> W6100<'a, Spi, RstPin> {
         device.transport.write_u8(&SYCR1, 0b10000000)?;
         // Lock SYSR registers
         device.transport.write_u8(&CHPLCKR, 0x00)?;
+
+        // Route every socket's interrupts to the INT pin.
+        device.transport.write_u8(&SIMR, 0xFF)?;
 
         Ok(())
     }
@@ -389,6 +412,63 @@ impl<'a, Spi: SpiDevice<u8>, RstPin: OutputPin> W6100<'a, Spi, RstPin> {
                 Err(e) => return Err(e),
             }
         }
+
+        Ok(())
+    }
+
+    /// Provide (or replace) the IPv4 addressing. Non-blocking and SPI-free: the
+    /// config is staged and applied to the chip by the next `service` tick. This
+    /// is the integration point for a static setup at startup or a future DHCP
+    /// client handing over a lease.
+    pub fn set_network_config(&self, config: NetworkConfig) -> Result<(), Error> {
+        *self.config.lock_mut()?.as_mut() = Some(config);
+        self.config_dirty.store(true, Ordering::Relaxed);
+
+        Ok(())
+    }
+
+    fn network_config(&self) -> Option<NetworkConfig> {
+        self.config.lock_mut().ok().and_then(|guard| *guard.as_ref())
+    }
+
+    /// The PHY link state most recently observed by `service` (cached, no SPI).
+    /// Use this from the application thread instead of `is_link_up`, which polls
+    /// the chip over the bus.
+    pub fn link_up(&self) -> bool {
+        self.link_up.load(Ordering::Relaxed)
+    }
+
+    /// One background step: manage the PHY link, apply any pending network
+    /// configuration, then drive every socket. Does all of its SPI work itself,
+    /// so it can run entirely from an interrupt (timer tick and/or the chip's
+    /// INT line) while the application thread only touches the socket handles.
+    /// Idempotent and non-blocking.
+    pub fn service(&self) -> Result<(), Error> {
+        let up = self.is_link_up()?;
+        let was_up = self.link_up.swap(up, Ordering::Relaxed);
+
+        if !up {
+            // Link just went down: reset the chip (re-arms occupied sockets so
+            // they reconnect once the link returns). Network settings are wiped
+            // by the reset, so the config must be re-applied on the way back up.
+            if was_up {
+                self.reset()?;
+                self.config_dirty.store(true, Ordering::Relaxed);
+            }
+
+            return Ok(());
+        }
+
+        // Apply pending network configuration once we actually have some. Until
+        // then the chip stays at 0.0.0.0 (e.g. waiting for DHCP).
+        if self.config_dirty.load(Ordering::Relaxed) {
+            if let Some(config) = self.network_config() {
+                self.setup_network(config.ip, config.gateway, config.subnet)?;
+                self.config_dirty.store(false, Ordering::Relaxed);
+            }
+        }
+
+        self.run()?;
 
         Ok(())
     }

@@ -12,6 +12,7 @@ cortex-m-rt = "0.7.5"
 # Panic behaviour, see https://crates.io/keywords/panic-impl for alternatives
 panic-halt = "1.0.0"
 bitflags = "2.4"
+static_cell = "2"
 
 [dependencies.stm32f1xx-hal]
 version = "0.11.0"
