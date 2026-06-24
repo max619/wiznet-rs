@@ -21,7 +21,7 @@ features = ["stm32f103"]
 
 # Your own crate: unoptimized, full debug info — fully debuggable.
 [profile.dev]
-opt-level = 0
+opt-level = 1
 debug = true
 
 # All dependencies: optimize for size and drop their debug info. This is what

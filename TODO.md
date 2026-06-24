@@ -4,15 +4,22 @@
 
 - [x] **Phase 1** — `SpiDma` trait + move the SPI impl into the app + drive the
       bulk transfers over DMA (blocking). Builds clean; `w6100` stays HAL-free.
-- [~] **Phase 1 correctness (in progress)** — bulk transfers now go through the
-      HAL's `Spi1RxTxDma::read_write` full-duplex DMA (`src/hal_spi.rs`), all SPI
-      (register ops included) routed through it. **Open bug:** SPI transactions
-      appear not to wait for the DMA transfer to complete — investigating what
-      `Transfer::wait()` keys off for `RxTxDma` (likely waits on the RX channel's
-      transfer-complete; confirm it isn't returning before the SPI shift register
-      drains / before TX has fully shifted out). Earlier symptom was echo garbage
-      from byte misalignment (stale `RXNE`/`OVR` + enable ordering) — addressed by
-      switching to the HAL's tested `read_write` path.
+- [x] **Phase 1 correctness** — bulk transfers go through the HAL's
+      `Spi1RxTxDma::read_write` full-duplex DMA (`src/hal_spi.rs`), all SPI
+      (register ops included) routed through it. **Root-caused & fixed:** the
+      early-return / truncated-read bug was a **stale RX transfer-complete flag**.
+      `Transfer::wait()` for `RxTxDma` keys "done" off the RX channel's `TCIF`
+      (`is_done() = !rxchannel.in_progress()`, `in_progress() = TCIF clear`), and
+      `start()` never clears it. The HAL clears it only in `stop()` via the DMA
+      **global**-clear bit (`CGIF`) — which does **not reliably stick on this
+      (clone) MCU**. So a leftover `TCIF` from the previous transfer made the next
+      `wait()` return immediately, reading a partially-filled buffer. **Fix:**
+      clear the channel-specific `CTCIF2` before each transfer (see Clone
+      hardware quirks). Validated in `examples/spi_dma_loopback.rs` (MISO↔MOSI
+      loopback): all sizes intact, blocking and interrupt-driven, up to 16 MHz.
+      **Confirmed on hardware** — `hal_spi.rs` rewritten (clean `Option` handling,
+      `DmaBuf` length-bounded transfers, `CTCIF2` clear); echo server works over
+      the blocking DMA path.
 - [ ] **Phase 2** — make the bulk payload genuinely async (start → return →
       DMA-complete IRQ → finish), with one-in-flight coordination.
 
@@ -109,6 +116,30 @@ kick off the DMA + enable the RX-channel TC interrupt and return; `finish`
 [done]; hand CS, rst, scratch to `HalSpi` [done]. Add `#[interrupt] fn
 DMA1_CHANNEL2()` → cached chip → `chip.dma_complete()`; enable RX-channel TC +
 `NVIC::unmask` [TODO]. Chip alias is `W6100<'static, HalSpi, Pin<'A',8,Output>>`.
+
+## Clone hardware quirks (STM32F103 "blue pill", likely a clone)
+
+These cost real debugging time — keep them in mind for all DMA work:
+
+- **DMA global-clear (`CGIF`) is unreliable.** The HAL's `dma::Ch::stop()` clears
+  flags by writing `IFCR.CGIFx`. On this part the `TCIF` often stays set after
+  that. **Always clear the channel-specific flag** (`IFCR.CTCIF<n>`) instead.
+  stm32f1xx-hal 0.11 exposes **no** per-channel event-clear (no `clear_event`;
+  that's stm32f4xx-hal), and the channel is hidden inside `Spi1RxTxDma`, so this
+  is a direct `CTCIF2` register write wrapped in one helper (`clear_spi1_rx_tc`
+  in `src/hal_spi.rs`). A stale `TCIF` bites twice: blocking `wait()` returns
+  early, and (Phase 2) with `TCIE` enabled it fires the completion IRQ instantly
+  on arm. Clear it before every transfer.
+- **Index numbering split (easy to get wrong).** SPI1_RX is DMA1 **channel 2**:
+  NVIC line `DMA1_CHANNEL2`, flag field `CTCIF2`/`TCIF2` (1-based), but the pac
+  register accessor is `DMA1.ch(1)` (0-based). The HAL's `dma1::C2` == `Ch<_, 1>`.
+- **`read_write` transfers the whole buffer.** `dma.read_write(&mut [u8; N], …)`
+  always moves `N` bytes (the buffer's array length), not a sub-length. To send
+  exactly `n` bytes, wrap the `'static` buffer in a type whose `ReadBuffer`/
+  `WriteBuffer` reports `n` (the `DmaBuf` wrapper in `src/hal_spi.rs`). Getting
+  this wrong clocks garbage past the intended frame (corrupts W6100 writes).
+- **SPI clock:** loopback-verified clean at **16 MHz** on this board (not just
+  the 1 MHz it was set to) — the size bump in `## Out of scope` is proven safe.
 
 ## Notes
 - A few scoped `#[allow(unsafe_code)]` blocks are needed in the **app** impl
