@@ -182,7 +182,7 @@ impl<D: SpiDmaDevice> Transceiver<D> {
                         offset += items.len();
                     }
 
-                    Operation::DelayNs(ns) => break,
+                    Operation::DelayNs(_) => break,
                 }
 
                 index += 1;
@@ -216,8 +216,8 @@ impl<D: SpiDmaDevice> Transceiver<D> {
 
             offset = 0;
 
-            while start_index < operations.len() {
-                match &mut operations[index] {
+            while start_index < index {
+                match &mut operations[start_index] {
                     Operation::Read(items)
                     | Operation::Transfer(items, _)
                     | Operation::TransferInPlace(items) => {
@@ -225,7 +225,14 @@ impl<D: SpiDmaDevice> Transceiver<D> {
                         offset += items.len();
                     }
 
-                    Operation::Write(_) | Operation::DelayNs(_) => (),
+                    // A write still clocks bytes onto the bus, so it occupies a
+                    // slot in the full-duplex rx mirror: advance `offset` past it
+                    // to stay aligned with the batching pass above (otherwise the
+                    // following reads copy from the wrong window).
+                    // NOTE: `Transfer(read, write)` assumes `read.len() ==
+                    // write.len()`; the driver only emits `Read`/`Write`.
+                    Operation::Write(items) => offset += items.len(),
+                    Operation::DelayNs(_) => (),
                 }
 
                 start_index += 1;
@@ -256,4 +263,176 @@ impl<D: SpiDmaDevice> Transceiver<D> {
     impl_write_primitive!(write_u8, u8);
     impl_write_primitive!(write_u16, u16);
     impl_write_primitive!(write_u32, u32);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use embedded_hal::{delay::DelayNs, spi::ErrorKind};
+    use std::{cell::RefCell, rc::Rc, vec, vec::Vec};
+
+    /// What every mock transfer captures / replays.
+    #[derive(Default)]
+    struct MockLog {
+        /// MOSI bytes (the active `len` window of `tx`) for each `transceive`.
+        transfers: Vec<Vec<u8>>,
+        /// Recorded `DelayNs` requests.
+        delays: Vec<u32>,
+    }
+
+    /// A `SpiDmaDevice` that records MOSI and synthesizes a deterministic,
+    /// *position-indexed* MISO response: `rx[i] = i`. That pattern is the whole
+    /// point — it lets a test tell apart "read the right window" from "read the
+    /// header-echo bytes", since the value equals the buffer offset it came from.
+    struct MockDevice {
+        log: Rc<RefCell<MockLog>>,
+    }
+
+    struct MockTransaction {
+        dev: MockDevice,
+        buffers: DmaBuffers,
+    }
+
+    impl SpiDmaTransaction<MockDevice> for MockTransaction {
+        fn wait(self) -> (MockDevice, DmaBuffers) {
+            (self.dev, self.buffers)
+        }
+    }
+
+    impl DelayNs for MockDevice {
+        fn delay_ns(&mut self, ns: u32) {
+            self.log.borrow_mut().delays.push(ns);
+        }
+    }
+
+    impl SpiDmaDevice for MockDevice {
+        type Error = ErrorKind;
+        type Transaction = MockTransaction;
+
+        fn transceive(
+            self,
+            buffers: DmaBuffers,
+        ) -> Result<Self::Transaction, (Self::Error, Self, DmaBuffers)> {
+            let len = buffers.len;
+            self.log.borrow_mut().transfers.push(buffers.tx[..len].to_vec());
+            for i in 0..len {
+                buffers.rx[i] = i as u8;
+            }
+            Ok(MockTransaction { dev: self, buffers })
+        }
+    }
+
+    /// Leak a zeroed buffer so it satisfies the `&'static mut` in `DmaBuffers`.
+    fn leak(n: usize) -> &'static mut [u8] {
+        vec![0u8; n].leak()
+    }
+
+    fn rig(scratch_len: usize) -> (Transceiver<MockDevice>, Rc<RefCell<MockLog>>) {
+        let log = Rc::new(RefCell::new(MockLog::default()));
+        let dev = MockDevice { log: log.clone() };
+        let scratch = DmaBuffers {
+            rx: leak(scratch_len),
+            tx: leak(scratch_len),
+            len: 0,
+        };
+        (Transceiver::new(dev, scratch), log)
+    }
+
+    const ADDR: Address = Address {
+        address: 0x1234,
+        block: BlockSelectionBits::CommonRegister,
+    };
+
+    /// The headline regression: a `read` must copy the payload window
+    /// (`rx[3..3+N]`), not the bytes clocked in under the 3-byte header.
+    #[test]
+    fn read_copies_payload_window_not_header() {
+        let (txr, log) = rig(16);
+        let mut buf = [0u8; 4];
+
+        txr.read(&ADDR, &mut buf).unwrap();
+
+        // rx[i] == i, header is 3 bytes => payload is rx[3..7].
+        assert_eq!(buf, [3, 4, 5, 6]);
+
+        let log = log.borrow();
+        assert_eq!(log.transfers.len(), 1, "one full-duplex transfer");
+        let mosi = &log.transfers[0];
+        assert_eq!(mosi.len(), 3 + 4, "header + read padding");
+        assert_eq!(&mosi[..2], &0x1234u16.to_be_bytes(), "address, big-endian");
+        assert_eq!(mosi[2] & 0b100, 0, "RWB clear on read");
+    }
+
+    /// A `write` stages header + payload as MOSI, sets the RWB bit, and copies
+    /// nothing back.
+    #[test]
+    fn write_stages_header_and_payload() {
+        let (txr, log) = rig(16);
+
+        txr.write(&ADDR, &[0xAA, 0xBB]).unwrap();
+
+        let log = log.borrow();
+        let mosi = &log.transfers[0];
+        assert_eq!(mosi.len(), 3 + 2);
+        assert_eq!(mosi[2] & 0b100, 0b100, "RWB set on write");
+        assert_eq!(&mosi[3..], &[0xAA, 0xBB]);
+    }
+
+    /// Primitive round-trip: `read_u16` decodes big-endian from the payload
+    /// window. (rx[3], rx[4]) == (3, 4) => 0x0304.
+    #[test]
+    fn read_u16_decodes_payload() {
+        let (txr, _log) = rig(16);
+        assert_eq!(txr.read_u16(&ADDR).unwrap(), 0x0304);
+    }
+
+    /// A batch larger than the scratch must split into multiple transfers, and
+    /// the read-back offset must reset per chunk. Scratch holds 4 bytes;
+    /// `[Write(2), Read(2), Read(2)]` packs the first two ops (offset 2+2=4),
+    /// then the trailing read goes in its own transfer.
+    #[test]
+    fn batch_splits_across_chunks_with_correct_offsets() {
+        let (txr, log) = rig(4);
+        let mut a = [0u8; 2];
+        let mut b = [0u8; 2];
+
+        txr.transaction(&mut [
+            Operation::Write(&[0x10, 0x20]),
+            Operation::Read(&mut a),
+            Operation::Read(&mut b),
+        ])
+        .unwrap();
+
+        // Chunk 1 = [Write(2), Read(2)] -> a reads rx[2..4] = [2, 3].
+        // Chunk 2 = [Read(2)]           -> b reads rx[0..2] = [0, 1].
+        assert_eq!(a, [2, 3]);
+        assert_eq!(b, [0, 1]);
+        assert_eq!(log.borrow().transfers.len(), 2);
+    }
+
+    /// A single operation that cannot fit the scratch is unsplittable and must
+    /// surface `ScratchBufferOverrun` rather than panic or truncate.
+    #[test]
+    fn oversized_single_op_reports_overrun() {
+        let (txr, _log) = rig(4);
+        let err = txr
+            .transaction(&mut [Operation::Write(&[0; 8])])
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            nb::Error::Other(DriverError::ScratchBufferOverrun)
+        ));
+    }
+
+    /// `DelayNs` is executed inline and never produces a bus transfer.
+    #[test]
+    fn delay_is_executed_without_transfer() {
+        let (txr, log) = rig(16);
+
+        txr.transaction(&mut [Operation::DelayNs(1_000)]).unwrap();
+
+        let log = log.borrow();
+        assert_eq!(log.delays, vec![1_000]);
+        assert!(log.transfers.is_empty());
+    }
 }

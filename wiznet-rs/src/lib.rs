@@ -1,5 +1,5 @@
 #![deny(unsafe_code)]
-#![no_std]
+#![cfg_attr(not(test), no_std)]
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
