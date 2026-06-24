@@ -72,7 +72,7 @@ fn main() -> ! {
     let spi = dp.SPI1.spi(
         (Some(gpio_a.pa5), Some(gpio_a.pa6), Some(gpio_a.pa7)),
         spi_mode,
-        1.MHz(),
+        16.MHz(),
         &mut rcc,
     );
 
@@ -229,4 +229,16 @@ fn EXTI15_10() {
     });
 
     service();
+}
+
+/// SPI1_RX DMA transfer-complete — finishes the in-flight async bulk payload
+/// transfer (the `main` thread ran free while it was clocking) and resumes
+/// servicing. The HAL clears the channel flag inside `dma_complete`'s `wait`.
+#[interrupt]
+fn DMA1_CHANNEL2() {
+    let chip = interrupt_free(|cs| CHIP.borrow(cs).get());
+
+    if let Some(chip) = chip {
+        chip.dma_complete();
+    }
 }

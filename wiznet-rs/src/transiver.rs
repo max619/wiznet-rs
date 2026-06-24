@@ -3,9 +3,12 @@ use core::mem;
 use embedded_hal::spi::Operation;
 
 use crate::{
-    DmaBuffers, DriverError, Error, SpiDmaDevice, SpiDmaTransaction,
+    Completion, DmaBuffers, DriverError, Error, SpiDmaDevice, SpiDmaTransaction,
     atomic_cell::{AtomicCell, AtomicMutLock},
 };
+
+/// Length of the W6100 SPI command header that precedes every payload.
+pub(crate) const HEADER: usize = 3;
 
 #[derive(Clone, Copy)]
 pub enum BlockSelectionBits {
@@ -44,12 +47,14 @@ pub enum BlockSelectionBits {
     Socket7RxBuffer = 0b111_11,
 }
 
+#[derive(Clone, Copy)]
 pub struct BlockAddress {
     pub(crate) reg: BlockSelectionBits,
     pub(crate) tx: BlockSelectionBits,
     pub(crate) rx: BlockSelectionBits,
 }
 
+#[derive(Clone, Copy)]
 pub struct Address {
     pub(crate) address: u16,
     pub(crate) block: BlockSelectionBits,
@@ -111,7 +116,7 @@ impl<D: SpiDmaDevice> Transceiver<D> {
     /// This is a sync method
     pub fn transaction(&self, operations: &mut [Operation<'_, u8>]) -> Result<(), Error> {
         let mut guard = self.device.lock_mut()?;
-        let mut cell = guard.as_mut();
+        let cell = guard.as_mut();
         let (dev, scratch_buffers) = {
             let current_state = mem::replace(cell, DmaState::Pending);
 
@@ -207,7 +212,7 @@ impl<D: SpiDmaDevice> Transceiver<D> {
             }
 
             scratch_buffers.len = offset;
-            match dev.transceive(scratch_buffers) {
+            match dev.transceive(scratch_buffers, Completion::Poll) {
                 Ok(transaction) => (dev, scratch_buffers) = transaction.wait(),
                 Err((_, dev, buffers)) => {
                     return (dev, buffers, Some(DriverError::SpiError));
@@ -263,6 +268,159 @@ impl<D: SpiDmaDevice> Transceiver<D> {
     impl_write_primitive!(write_u8, u8);
     impl_write_primitive!(write_u16, u16);
     impl_write_primitive!(write_u32, u32);
+
+    /// Take the device + scratch out of `Idle`, leaving `Pending`. Returns
+    /// `WouldBlock` if a transfer is already in flight (or the cell is mid-op).
+    fn take_idle(&self, cell: &mut DmaState<D>) -> Result<(D, DmaBuffers), Error> {
+        match mem::replace(cell, DmaState::Pending) {
+            DmaState::Idle {
+                dev,
+                scratch_buffers,
+            } => Ok((dev, scratch_buffers)),
+            other => {
+                *cell = other;
+                Err(nb::Error::WouldBlock)
+            }
+        }
+    }
+
+    /// Start an **asynchronous** bulk read of `len` payload bytes from `addr`.
+    /// The DMA-complete interrupt is armed; the captured bytes are collected by a
+    /// matching [`finish_read`](Self::finish_read) once it fires. Returns
+    /// `WouldBlock` if a transfer is already in flight.
+    pub fn start_read(&self, addr: &Address, len: usize) -> Result<(), Error> {
+        let mut guard = self.device.lock_mut()?;
+        let cell = guard.as_mut();
+        let (dev, mut scratch) = self.take_idle(cell)?;
+
+        if HEADER + len > scratch.tx.len() {
+            *cell = DmaState::Idle {
+                dev,
+                scratch_buffers: scratch,
+            };
+            return Err(nb::Error::Other(DriverError::ScratchBufferOverrun));
+        }
+
+        scratch.tx[..HEADER].copy_from_slice(&create_header(addr, false));
+        scratch.len = HEADER + len;
+
+        match dev.transceive(scratch, Completion::Interrupt) {
+            Ok(txn) => {
+                *cell = DmaState::InFlight(txn);
+                Ok(())
+            }
+            Err((_, dev, scratch_buffers)) => {
+                *cell = DmaState::Idle {
+                    dev,
+                    scratch_buffers,
+                };
+                Err(nb::Error::Other(DriverError::SpiError))
+            }
+        }
+    }
+
+    /// Finish an in-flight bulk read: block for completion (instant once the
+    /// transfer-complete flag is set), hand the captured payload window to
+    /// `consume`, and return to `Idle`. Returns `WouldBlock` if nothing is in
+    /// flight.
+    pub fn finish_read<F: FnOnce(&[u8])>(&self, len: usize, consume: F) -> Result<(), Error> {
+        let mut guard = self.device.lock_mut()?;
+        let cell = guard.as_mut();
+        let txn = match mem::replace(cell, DmaState::Pending) {
+            DmaState::InFlight(txn) => txn,
+            other => {
+                *cell = other;
+                return Err(nb::Error::WouldBlock);
+            }
+        };
+
+        let (dev, scratch_buffers) = txn.wait();
+        consume(&scratch_buffers.rx[HEADER..HEADER + len]);
+        *cell = DmaState::Idle {
+            dev,
+            scratch_buffers,
+        };
+        Ok(())
+    }
+
+    /// Start an **asynchronous** bulk write of `len` payload bytes to `addr`.
+    /// `fill` stages the payload directly into the scratch TX window (e.g. by
+    /// draining a ring), so no temporary copy is needed. Returns `WouldBlock` if
+    /// a transfer is already in flight.
+    pub fn start_write<F: FnOnce(&mut [u8])>(
+        &self,
+        addr: &Address,
+        len: usize,
+        fill: F,
+    ) -> Result<(), Error> {
+        let mut guard = self.device.lock_mut()?;
+        let cell = guard.as_mut();
+        let (dev, mut scratch) = self.take_idle(cell)?;
+
+        if HEADER + len > scratch.tx.len() {
+            *cell = DmaState::Idle {
+                dev,
+                scratch_buffers: scratch,
+            };
+            return Err(nb::Error::Other(DriverError::ScratchBufferOverrun));
+        }
+
+        scratch.tx[..HEADER].copy_from_slice(&create_header(addr, true));
+        fill(&mut scratch.tx[HEADER..HEADER + len]);
+        scratch.len = HEADER + len;
+
+        match dev.transceive(scratch, Completion::Interrupt) {
+            Ok(txn) => {
+                *cell = DmaState::InFlight(txn);
+                Ok(())
+            }
+            Err((_, dev, scratch_buffers)) => {
+                *cell = DmaState::Idle {
+                    dev,
+                    scratch_buffers,
+                };
+                Err(nb::Error::Other(DriverError::SpiError))
+            }
+        }
+    }
+
+    /// Finish an in-flight bulk write: block for completion and return to `Idle`.
+    /// Returns `WouldBlock` if nothing is in flight.
+    pub fn finish_write(&self) -> Result<(), Error> {
+        let mut guard = self.device.lock_mut()?;
+        let cell = guard.as_mut();
+        let txn = match mem::replace(cell, DmaState::Pending) {
+            DmaState::InFlight(txn) => txn,
+            other => {
+                *cell = other;
+                return Err(nb::Error::WouldBlock);
+            }
+        };
+
+        let (dev, scratch_buffers) = txn.wait();
+        *cell = DmaState::Idle {
+            dev,
+            scratch_buffers,
+        };
+        Ok(())
+    }
+
+    /// Tear down any in-flight transfer (link-down reset): block for it to drain
+    /// so the bus and buffers are returned and nothing hangs. A no-op when idle.
+    pub fn abort(&self) {
+        if let Ok(mut guard) = self.device.lock_mut() {
+            let cell = guard.as_mut();
+            if matches!(cell, DmaState::InFlight(_)) {
+                if let DmaState::InFlight(txn) = mem::replace(cell, DmaState::Pending) {
+                    let (dev, scratch_buffers) = txn.wait();
+                    *cell = DmaState::Idle {
+                        dev,
+                        scratch_buffers,
+                    };
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -312,6 +470,7 @@ mod tests {
         fn transceive(
             self,
             buffers: DmaBuffers,
+            _completion: Completion,
         ) -> Result<Self::Transaction, (Self::Error, Self, DmaBuffers)> {
             let len = buffers.len;
             self.log.borrow_mut().transfers.push(buffers.tx[..len].to_vec());
@@ -434,5 +593,81 @@ mod tests {
         let log = log.borrow();
         assert_eq!(log.delays, vec![1_000]);
         assert!(log.transfers.is_empty());
+    }
+
+    /// The async read mirrors the sync one: `start_read` clocks header + read
+    /// padding, `finish_read` hands back the payload window (`rx[3..3+len]`).
+    #[test]
+    fn async_read_starts_and_finishes() {
+        let (txr, log) = rig(16);
+
+        txr.start_read(&ADDR, 4).unwrap();
+
+        // While in flight, the bus is owned: a sync op must defer.
+        assert!(matches!(
+            txr.transaction(&mut [Operation::Read(&mut [0u8; 1])]),
+            Err(nb::Error::WouldBlock)
+        ));
+
+        let mut got = [0u8; 4];
+        txr.finish_read(4, |payload| got.copy_from_slice(payload))
+            .unwrap();
+        assert_eq!(got, [3, 4, 5, 6]);
+
+        let log = log.borrow();
+        assert_eq!(log.transfers.len(), 1);
+        let mosi = &log.transfers[0];
+        assert_eq!(mosi.len(), 3 + 4);
+        assert_eq!(mosi[2] & 0b100, 0, "RWB clear on read");
+
+        // Back to idle: a sync op succeeds again.
+        drop(log);
+        txr.read_u8(&ADDR).unwrap();
+    }
+
+    /// The async write stages header + payload via the `fill` closure and sets
+    /// the RWB bit; `finish_write` releases the transport.
+    #[test]
+    fn async_write_starts_and_finishes() {
+        let (txr, log) = rig(16);
+
+        txr.start_write(&ADDR, 2, |buf| buf.copy_from_slice(&[0xAA, 0xBB]))
+            .unwrap();
+        txr.finish_write().unwrap();
+
+        let log = log.borrow();
+        let mosi = &log.transfers[0];
+        assert_eq!(mosi.len(), 3 + 2);
+        assert_eq!(mosi[2] & 0b100, 0b100, "RWB set on write");
+        assert_eq!(&mosi[3..], &[0xAA, 0xBB]);
+    }
+
+    /// A single op larger than the scratch is rejected up front, leaving the
+    /// transport idle (no transfer issued).
+    #[test]
+    fn async_oversized_read_reports_overrun() {
+        let (txr, log) = rig(4);
+        let err = txr.start_read(&ADDR, 8).unwrap_err();
+        assert!(matches!(
+            err,
+            nb::Error::Other(DriverError::ScratchBufferOverrun)
+        ));
+        assert!(log.borrow().transfers.is_empty());
+        // Still usable.
+        txr.read_u8(&ADDR).unwrap();
+    }
+
+    /// `abort` drains an in-flight transfer and returns the transport to idle.
+    #[test]
+    fn abort_drains_in_flight() {
+        let (txr, _log) = rig(16);
+        txr.start_read(&ADDR, 4).unwrap();
+        txr.abort();
+        // Idle again: a sync op works and finishing now would WouldBlock.
+        txr.read_u8(&ADDR).unwrap();
+        assert!(matches!(
+            txr.finish_write(),
+            Err(nb::Error::WouldBlock)
+        ));
     }
 }

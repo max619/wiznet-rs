@@ -436,6 +436,25 @@ pub(crate) fn read_rx_buffer<D: SpiDmaDevice>(
     )
 }
 
+/// **Start** an asynchronous burst-read of `len` bytes out of the SOCKET's RX
+/// buffer at `pointer`. Captured into scratch; delivered to the ring and the
+/// read pointer committed by `W6100::dma_complete`. The chip auto-increments and
+/// wraps within the buffer region.
+pub(crate) fn start_read_rx_buffer<D: SpiDmaDevice>(
+    block: &BlockAddress,
+    trans: &Transceiver<D>,
+    pointer: u16,
+    len: usize,
+) -> Result<(), Error> {
+    trans.start_read(
+        &Address {
+            address: pointer,
+            block: block.rx,
+        },
+        len,
+    )
+}
+
 /// Free space (in bytes) currently available in the SOCKET's TX buffer.
 pub(crate) fn get_tx_free_size<D: SpiDmaDevice>(
     block: &BlockAddress,
@@ -487,6 +506,28 @@ pub(crate) fn write_tx_buffer<D: SpiDmaDevice>(
             block: block.tx,
         },
         data,
+    )
+}
+
+/// **Start** an asynchronous burst-write of `len` bytes into the SOCKET's TX
+/// buffer at `pointer`. `fill` stages the payload directly into scratch (e.g. by
+/// draining a ring); the write pointer is committed and `SEND` issued by
+/// `W6100::dma_complete`. The chip auto-increments and wraps within the buffer
+/// region.
+pub(crate) fn start_write_tx_buffer<D: SpiDmaDevice, F: FnOnce(&mut [u8])>(
+    block: &BlockAddress,
+    trans: &Transceiver<D>,
+    pointer: u16,
+    len: usize,
+    fill: F,
+) -> Result<(), Error> {
+    trans.start_write(
+        &Address {
+            address: pointer,
+            block: block.tx,
+        },
+        len,
+        fill,
     )
 }
 

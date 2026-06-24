@@ -28,10 +28,16 @@ The target (`thumbv7m-none-eabi`) and linker are set in `.cargo/config.toml`, so
   probe (e.g. ST-Link). VS Code launch config: `.vscode/launch.json`.
 - **Verify the driver stays platform-independent:**
   `grep -rn stm32f1xx_hal wiznet-rs/src/` must return nothing (see below).
+- **Host unit tests:** `cargo test -p wiznet-rs --target <host-triple>` (e.g.
+  `aarch64-apple-darwin`) — the `--target` override is required because the
+  workspace default target is `thumbv7m-none-eabi`. The driver's
+  platform-independent logic (`spsc_ring`, the `Transceiver` framing/batching and
+  async start/finish) has `#[cfg(test)]` unit tests that run under `std` via the
+  mock `SpiDmaDevice`.
 
-There are **no automated tests** (it's `no_std` firmware). "Testing" means
-flashing to the board and exercising the echo server: `nc 192.168.10.10 5555`,
-type bytes, expect them echoed back. PC13 LED lights while a client is connected.
+End-to-end **hardware testing** has no harness: flash and exercise the echo
+server: `nc 192.168.10.10 5555`, type bytes, expect them echoed back. PC13 LED
+lights while a client is connected.
 
 Dev profile note (root `Cargo.toml`): your crates build at `opt-level = 1` with
 debug info; all dependencies build at `opt-level = "z"` with debug stripped.
@@ -51,56 +57,79 @@ Don't "fix" this — it's a deliberate size/debuggability split.
 
 ### Ownership is inverted (this surprises people)
 
-`W6100` **owns** the 8 hardware socket slots as `[AtomicCell<SocketBackend>; 8]`.
-A `SocketBackend` holds the real state: the protocol state machine and the rx/tx
-ring buffers. User code receives a thin **handle** (`TcpSocket`) that only holds
-`&'a AtomicCell<SocketBackend>`. Handle methods (`read`/`write`/`status`/`close`/
-`reconnect`) touch **only the local ring buffers — never SPI**. Dropping a handle
-marks the slot for release; `run` closes it on the chip and frees the slot.
+`W6100` **owns** the 8 hardware socket slots as `[Socket; 8]`, where each
+`Socket` is `{ backend: AtomicCell<SocketBackend>, rings: SocketRings }`. The
+`SocketBackend` (behind the cell) holds the protocol state machine; the rx/tx
+**ring buffers live in `rings`, a sibling of the cell, not inside it** — they are
+lock-free SPSC (`spsc_ring.rs`, see below). User code receives a thin **handle**
+(`TcpSocket`) holding `&'a Socket`. Its data methods (`read`/`write`) touch
+**only the lock-free rings — no cell, no SPI**; its control methods
+(`status`/`close`/`reconnect`/drop) go through the protocol cell. Dropping a
+handle marks the slot for release; `run` closes it on the chip and frees the slot.
 
 ### Interior mutability + the singleton + WouldBlock-retry
 
 `atomic_cell.rs` is a custom try-lock cell (an `AtomicBool` "busy" flag, not a
 critical section). Every `W6100` method takes `&self`, so the chip can live as a
 `&'static` singleton (via `StaticCell` in `main`) shared between `main` and the
-interrupt handlers. Contention (e.g. a handle `read()` racing the ISR servicing
-that socket) surfaces as **`Err(nb::Error::WouldBlock)`** (an `AtomicError` maps
-to it) that the caller retries — chosen over `cortex_m::interrupt::Mutex`
-precisely so interrupts are *not* disabled during the long SPI transfers. `main`
-treats `WouldBlock` as "try again next tick". The driver's error type is
-`Error = nb::Error<DriverError>` (`error.rs`).
+interrupt handlers. Contention on a cell (e.g. a handle `status()` racing the ISR
+servicing that socket) surfaces as **`Err(nb::Error::WouldBlock)`** (an
+`AtomicError` maps to it) that the caller retries — chosen over
+`cortex_m::interrupt::Mutex` precisely so interrupts are *not* disabled during the
+long SPI transfers. `main` treats `WouldBlock` as "try again next tick". The
+driver's error type is `Error = nb::Error<DriverError>` (`error.rs`).
+
+The **data path is cell-free**: the rx/tx rings are lock-free SPSC, so a handle
+`read`/`write` never contends and never `WouldBlock`s. This is what lets the
+DMA-complete IRQ (`dma_complete`) deliver a finished payload into the rx ring
+without taking a socket cell — the ISR can't wait for lower-priority `main`, and
+a cell try-lock there would risk a tail-chain livelock. Each ring has exactly one
+producer and one consumer split across the interrupt boundary (rx: ISR→`main`,
+tx: `main`→ISR); they synchronize via monotonic `head`/`tail` (`Acquire`/`Release`).
 
 ### All SPI runs in the background; `main` is application-only
 
 `W6100::service()` does every SPI operation: it polls the PHY link, (re)applies
 the runtime network config, and advances all socket state machines one step. It
-is called from two interrupt handlers in `main.rs`:
+is called from interrupt handlers in `main.rs`:
 - **`TIM2`** — 1 ms periodic tick (drives non-interrupt transitions + TX flush +
   missed-edge backstop).
 - **`EXTI15_10`** — the W6100 INT line (PA10), low-latency wake on chip events.
+- **`DMA1_CHANNEL2`** — SPI1_RX DMA transfer-complete, finishing an async bulk
+  payload transfer via `chip.dma_complete()` (see the transport stack).
 
-`main`'s loop only calls handle methods (`status`/`read`/`write`/`reconnect`) and
-`wfi()`s. It uses the *cached* link state `chip.link_up()` (no SPI) to gate setup.
+While a bulk DMA is in flight the SPI bus is owned: `W6100` records it in
+`bulk: Option<BulkOp>`, `run` stops after starting it, and `service` defers all
+SPI until `dma_complete` clears it. `main`'s loop only calls handle methods
+(`status`/`read`/`write`/`reconnect`) and `wfi()`s — and now genuinely runs
+*during* a large transfer. It uses the *cached* link state `chip.link_up()` (no
+SPI) to gate setup.
 
 ### Socket state machines (`tcp_socket.rs`)
 
 Non-blocking: each `run` tick advances one step
 (`Init → Opening → Connecting`/`Listening → Established → Closing → Closed`).
 `receive`/`transmit` move bytes between the chip's RX/TX buffers and the local
-ring buffers (`ring_buffer.rs`) with back-pressure; the local ring is drained
-before a graceful close so no received data is lost. Protocol variety is an
-**enum** (`BackendState { Free, Tcp(TcpSocketState) }` in `socket.rs`) — add UDP
-etc. as a new variant, no trait objects.
+SPSC rings (`spsc_ring.rs`) with back-pressure. They are **async-start**: a tick
+kicks off one bulk DMA and returns `BulkAction::Started` (the bus is now owned);
+`W6100::dma_complete` delivers the payload and commits the chip pointers when the
+DMA finishes. The graceful-close flush (`flush_sync`) stays **synchronous** (rare
+path) so completion never has to mutate `status`. Protocol variety is an **enum**
+(`BackendState { Free, Tcp(TcpSocketState) }` in `socket.rs`) — add UDP etc. as a
+new variant, no trait objects.
 
 ### SPI/DMA transport stack (bottom to top)
 
 - `SpiDmaDevice` + `SpiDmaTransaction` (`wiznet-rs/src/spi_dma.rs`) — the
   app-side contract. `SpiDmaDevice` is a `DelayNs` device that **consumes
   itself** and runs one full-duplex DMA over `DmaBuffers` (the rx/tx scratch
-  slices plus an active `len`), returning a `SpiDmaTransaction`. `wait()` blocks
-  for completion (Phase 2: a DMA-complete IRQ) and hands the device **and**
-  buffers back. Deliberately knows nothing of W6100 (`Address`, block bits,
-  reset are all driver/GPIO concepts that stay above it).
+  slices plus an active `len`), returning a `SpiDmaTransaction`. `transceive`
+  takes a `Completion::{Poll, Interrupt}` flag: `Poll` for small synchronous ops
+  (the caller blocks in `wait()`); `Interrupt` for the bulk payload (the app arms
+  the DMA-complete IRQ **before** enabling the channel, then `wait()` is instant
+  once the IRQ fires). `wait()` hands the device **and** buffers back.
+  Deliberately knows nothing of W6100 (`Address`, block bits, reset are all
+  driver/GPIO concepts that stay above it).
 - `HalSpi` (`examples/tcp_echo/src/hal_spi.rs`) — concrete impl over the HAL's
   `Spi1RxTxDma::read_write`. Holds only the DMA SPI, the CS pin, and the clock;
   it manages CS across a transfer (assert in `transceive`, release in `wait`).
@@ -112,14 +141,15 @@ etc. as a new variant, no trait objects.
   `write_u8/16/32`) plus a generic `transaction(&mut [Operation])`. It builds the
   W6100 3-byte command header (`create_header`), batches operations into the
   scratch buffers, and runs **one full-duplex `transceive` per chunk that fits**,
-  then copies the captured bytes back into the read operands.
+  then copies the captured bytes back into the read operands. For the bulk
+  payload it also exposes a non-blocking pair — `start_read`/`finish_read` and
+  `start_write`/`finish_write` (closures deliver/stage the payload so scratch
+  never escapes), plus `abort` — driven by `DmaState::{Idle, InFlight}`.
 
-> The bulk-DMA transport is under active development (moving from a blocking
-> `transceive(...)` + immediate `wait()` toward a true async DMA-complete
-> interrupt; the `DmaState::{Idle, InFlight, Pending}` machinery in
-> `transiver.rs` is the seam for it). While a DMA transfer is in flight the SPI
-> bus is fully owned — **no other SPI of any kind** (register polls, commands)
-> may run until it completes; `service()` must defer. See `TODO.md`.
+> While a DMA transfer is in flight the SPI bus is fully owned — **no other SPI
+> of any kind** (register polls, commands) may run until it completes; `service()`
+> defers (it bails while `W6100.bulk` is `Some`). The async bulk path landed in
+> Phase 2; see `TODO.md`.
 
 ## Conventions / gotchas
 

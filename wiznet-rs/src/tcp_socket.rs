@@ -1,14 +1,15 @@
 use crate::{
     DriverError, Error, SpiDmaDevice,
-    atomic_cell::{AtomicCell, AtomicMutLock},
-    ring_buffer::RingBuffer,
-    socket::{SocketBackend, SocketProtocolMode, SocketStatus},
+    atomic_cell::AtomicMutLock,
+    socket::{
+        BulkAction, BulkKind, Socket, SocketProtocolMode, SocketRings, SocketStatus,
+    },
     socket_common::{
         SocketCommand, SocketInterrupt, SocketStatusRegister, clear_interrupts, get_interrupts,
         get_rx_read_pointer, get_rx_received_size, get_tx_free_size, get_tx_write_pointer,
-        init_socket, is_command_pending, read_rx_buffer, read_status, send_sock_command,
-        set_dst_port, set_ipv4_dst_addr, set_rx_read_pointer, set_src_port, set_tx_write_pointer,
-        write_tx_buffer,
+        init_socket, is_command_pending, read_status, send_sock_command, set_dst_port,
+        set_ipv4_dst_addr, set_src_port, set_tx_write_pointer, start_read_rx_buffer,
+        start_write_tx_buffer, write_tx_buffer,
     },
     tcp_socket::TcpMode::{Connect, Listen},
     transiver::{BlockAddress, Transceiver},
@@ -25,16 +26,15 @@ enum TcpMode {
     },
 }
 
-/// The TCP protocol state machine and its buffers. Lives inside a
-/// [`SocketBackend`] slot owned by the `W6100`; it is driven by `run` (which
-/// has chip access) and read/written through a [`TcpSocket`] handle (which does
-/// not — it only touches the local rings).
-pub(crate) struct TcpSocketState<'a> {
+/// The TCP protocol state machine. Lives inside a [`SocketBackend`] slot owned by
+/// the `W6100`; it is driven by `run` (which has chip access) and observed
+/// through a [`TcpSocket`] handle. The handle's data path (`read`/`write`) no
+/// longer goes through here — it touches the socket's lock-free
+/// [`SocketRings`](crate::socket::SocketRings) directly — so this struct holds
+/// only protocol state, not the rings.
+pub(crate) struct TcpSocketState {
     mode: TcpMode,
     status: SocketStatus,
-
-    rx_buffer: RingBuffer<'a>,
-    tx_buffer: RingBuffer<'a>,
 
     pending_error: Option<Error>,
 
@@ -43,14 +43,8 @@ pub(crate) struct TcpSocketState<'a> {
     close_requested: bool,
 }
 
-impl<'a> TcpSocketState<'a> {
-    pub(crate) fn connect(
-        addr: u32,
-        port: u16,
-        src_port: u16,
-        rx_buffer: &'a mut [u8],
-        tx_buffer: &'a mut [u8],
-    ) -> Self {
+impl TcpSocketState {
+    pub(crate) fn connect(addr: u32, port: u16, src_port: u16) -> Self {
         Self {
             mode: Connect {
                 dst_addr: addr,
@@ -58,38 +52,18 @@ impl<'a> TcpSocketState<'a> {
                 src_port,
             },
             status: SocketStatus::Init,
-
-            rx_buffer: RingBuffer::new(rx_buffer),
-            tx_buffer: RingBuffer::new(tx_buffer),
-
             pending_error: None,
-
             close_requested: false,
         }
     }
 
-    pub(crate) fn listen(port: u16, rx_buffer: &'a mut [u8], tx_buffer: &'a mut [u8]) -> Self {
+    pub(crate) fn listen(port: u16) -> Self {
         Self {
             mode: Listen { src_port: port },
             status: SocketStatus::Init,
-
-            rx_buffer: RingBuffer::new(rx_buffer),
-            tx_buffer: RingBuffer::new(tx_buffer),
-
             pending_error: None,
-
             close_requested: false,
         }
-    }
-
-    /// Drain up to `dst.len()` already-received bytes from the local rx ring.
-    pub(crate) fn read(&mut self, dst: &mut [u8]) -> usize {
-        self.rx_buffer.read(dst)
-    }
-
-    /// Stage up to `src.len()` bytes into the local tx ring for transmission.
-    pub(crate) fn write(&mut self, src: &[u8]) -> usize {
-        self.tx_buffer.write(src)
     }
 
     pub(crate) fn status(&self) -> SocketStatus {
@@ -121,30 +95,18 @@ impl<'a> TcpSocketState<'a> {
         )
     }
 
-    fn store_error<F: FnMut(&mut Self) -> Result<(), Error>>(
-        &mut self,
-        mut f: F,
-    ) -> Result<(), Error> {
-        match f(self) {
-            Ok(_) => Ok(()),
-            Err(e) => match e {
-                Error::WouldBlock => Err(Error::WouldBlock),
-                e => {
-                    self.pending_error = Some(e);
-                    Ok(())
-                }
-            },
-        }
-    }
-
     /// Act on a pending close request. For a live connection this sends a
     /// graceful FIN (`DISCON`) after one best-effort flush of staged tx data;
     /// for a socket still coming up it aborts with `CLOSE`. Either way we land
     /// in a closing state and the existing teardown machinery finishes the job.
+    ///
+    /// The flush is **synchronous** (the rare close path), so completion never
+    /// has to mutate `status` from the DMA-complete interrupt.
     fn handle_close<D: SpiDmaDevice>(
         &mut self,
         block: &BlockAddress,
         trans: &Transceiver<D>,
+        rings: &SocketRings,
     ) -> Result<(), Error> {
         self.close_requested = false;
 
@@ -161,7 +123,7 @@ impl<'a> TcpSocketState<'a> {
             // (bounded: a single pass) so already-staged bytes go out ahead of
             // the FIN; anything that doesn't fit on the chip is dropped.
             SocketStatus::Established => {
-                self.transmit(block, trans)?;
+                self.flush_sync(block, trans, rings)?;
 
                 send_sock_command(block, trans, SocketCommand::Disconnect)?;
                 self.status = SocketStatus::Closing;
@@ -339,108 +301,124 @@ impl<'a> TcpSocketState<'a> {
         }
     }
 
-    /// Move any data waiting in the chip's RX buffer into the local rx ring,
-    /// limited by the room available there. Anything that doesn't fit is left
-    /// on the chip and picked up on a later tick. Non-blocking.
-    ///
-    /// Returns the number of bytes still sitting in the chip's RX buffer after
-    /// this pass (non-zero only when the local ring filled up). A return of `0`
-    /// means the chip buffer is fully drained.
+    /// If the chip has received data and the local rx ring has room, **start** an
+    /// asynchronous DMA of `min(available, ring free)` bytes from the chip into
+    /// scratch. The bytes are delivered into the ring and the read pointer is
+    /// committed by `W6100::dma_complete` once the DMA finishes. One transfer per
+    /// call; the chip's RX buffer is re-checked on the next tick. Non-blocking.
     fn receive<D: SpiDmaDevice>(
         &mut self,
         block: &BlockAddress,
         trans: &Transceiver<D>,
-    ) -> Result<usize, Error> {
+        rings: &SocketRings,
+    ) -> Result<BulkAction, Error> {
         let available = get_rx_received_size(block, trans)? as usize;
         if available == 0 {
-            return Ok(0);
+            return Ok(BulkAction::None);
         }
 
-        let to_read = core::cmp::min(available, self.rx_buffer.free());
+        let to_read = core::cmp::min(available, rings.rx.free());
         if to_read == 0 {
             // No local room; leave the data on the chip and try again later.
-            return Ok(available);
+            return Ok(BulkAction::None);
         }
 
-        // The local ring may wrap, so copy in up to two contiguous chunks. The
-        // chip auto-advances/wraps its own buffer, so we just keep stepping the
-        // read pointer by the amount consumed.
-        let mut pointer = get_rx_read_pointer(block, trans)?;
-        let mut remaining = to_read;
-        while remaining > 0 {
-            let region = self.rx_buffer.writable();
-            let n = core::cmp::min(region.len(), remaining);
+        let pointer = get_rx_read_pointer(block, trans)?;
+        start_read_rx_buffer(block, trans, pointer, to_read)?;
 
-            read_rx_buffer(block, trans, pointer, &mut region[..n])?;
-            self.rx_buffer.advance_write(n);
-
-            pointer = pointer.wrapping_add(n as u16);
-            remaining -= n;
-        }
-
-        // Commit the consumed bytes back to the chip and free its buffer.
-        set_rx_read_pointer(block, trans, pointer)?;
-        send_sock_command(block, trans, SocketCommand::Receive)?;
-        clear_interrupts(block, trans, SocketInterrupt::RECV)?;
-
-        Ok(available - to_read)
+        Ok(BulkAction::Started {
+            kind: BulkKind::Receive,
+            pointer,
+            len: to_read,
+        })
     }
 
-    /// Push data staged in the local tx ring into the chip's TX buffer and
-    /// kick off transmission, limited by the room available on the chip.
-    /// Anything that doesn't fit stays in the ring for a later tick. Non-blocking.
-    ///
-    /// Returns the number of bytes still queued in the local tx ring after this
-    /// pass (non-zero only when the chip's TX buffer filled up). A return of `0`
-    /// means everything staged has been handed to the chip.
+    /// If the local tx ring has staged data and the chip has room, **start** an
+    /// asynchronous DMA of `min(pending, chip free)` bytes out of the ring (the
+    /// `fill` closure drains it straight into scratch) to the chip. The write
+    /// pointer is committed and `SEND` issued by `W6100::dma_complete` once the
+    /// DMA finishes. Non-blocking.
     fn transmit<D: SpiDmaDevice>(
         &mut self,
         block: &BlockAddress,
         trans: &Transceiver<D>,
-    ) -> Result<usize, Error> {
-        let pending = self.tx_buffer.len();
+        rings: &SocketRings,
+    ) -> Result<BulkAction, Error> {
+        let pending = rings.tx.len();
         if pending == 0 {
-            return Ok(0);
+            return Ok(BulkAction::None);
         }
 
         let free = get_tx_free_size(block, trans)? as usize;
         let to_send = core::cmp::min(pending, free);
         if to_send == 0 {
             // Chip TX buffer is full; leave the data staged and retry later.
-            return Ok(pending);
+            return Ok(BulkAction::None);
         }
 
-        // The local ring may wrap, so copy out in up to two contiguous chunks.
-        // The chip auto-advances/wraps its own buffer, so we just keep stepping
-        // the write pointer by the amount staged.
+        let pointer = get_tx_write_pointer(block, trans)?;
+        start_write_tx_buffer(block, trans, pointer, to_send, |buf| {
+            rings.tx.read(buf);
+        })?;
+
+        Ok(BulkAction::Started {
+            kind: BulkKind::Transmit,
+            pointer,
+            len: to_send,
+        })
+    }
+
+    /// Synchronous best-effort flush used by the graceful-close path: push as
+    /// much staged tx data as fits onto the chip in one pass and `SEND`. Bounded
+    /// and blocking — close is rare, and keeping it synchronous means the
+    /// completion interrupt never has to change `status`.
+    fn flush_sync<D: SpiDmaDevice>(
+        &mut self,
+        block: &BlockAddress,
+        trans: &Transceiver<D>,
+        rings: &SocketRings,
+    ) -> Result<(), Error> {
+        let pending = rings.tx.len();
+        if pending == 0 {
+            return Ok(());
+        }
+
+        let free = get_tx_free_size(block, trans)? as usize;
+        let to_send = core::cmp::min(pending, free);
+        if to_send == 0 {
+            return Ok(());
+        }
+
         let mut pointer = get_tx_write_pointer(block, trans)?;
-        let mut remaining = to_send;
-        while remaining > 0 {
-            let region = self.tx_buffer.readable();
-            let n = core::cmp::min(region.len(), remaining);
+        let mut staged = 0;
+        let mut tmp = [0u8; 64];
+        while staged < to_send {
+            let n = core::cmp::min(tmp.len(), to_send - staged);
+            let got = rings.tx.read(&mut tmp[..n]);
+            if got == 0 {
+                break;
+            }
 
-            write_tx_buffer(block, trans, pointer, &region[..n])?;
-            self.tx_buffer.advance_read(n);
-
-            pointer = pointer.wrapping_add(n as u16);
-            remaining -= n;
+            write_tx_buffer(block, trans, pointer, &tmp[..got])?;
+            pointer = pointer.wrapping_add(got as u16);
+            staged += got;
         }
 
-        // Commit the new write pointer and tell the chip to send.
         set_tx_write_pointer(block, trans, pointer)?;
         send_sock_command(block, trans, SocketCommand::Send)?;
 
-        Ok(pending - to_send)
+        Ok(())
     }
 
     /// Idle health-check for an established connection: watch for the failure
-    /// and teardown conditions that can occur while we are not actively
-    /// sending or receiving.
+    /// and teardown conditions, then move data. A bulk receive/transmit returns
+    /// `Started` (bus now owned, finished from the DMA-complete interrupt).
     fn handle_established<D: SpiDmaDevice>(
         &mut self,
         block: &BlockAddress,
         trans: &Transceiver<D>,
-    ) -> Result<(), Error> {
+        rings: &SocketRings,
+    ) -> Result<BulkAction, Error> {
         let interrupts = get_interrupts(block, trans)?;
 
         // Retransmission / keep-alive timeout: the peer is unreachable, so the
@@ -451,7 +429,7 @@ impl<'a> TcpSocketState<'a> {
             send_sock_command(block, trans, SocketCommand::Close)?;
             self.status = SocketStatus::ClosingDueToTimeout;
 
-            return Ok(());
+            return Ok(BulkAction::None);
         }
 
         // FIN received from the peer. Acknowledge the interrupt; the status
@@ -461,36 +439,33 @@ impl<'a> TcpSocketState<'a> {
         }
 
         match read_status(block, trans)? {
-            // Still connected and healthy — pull down any pending data and push
-            // out anything we have staged to send.
-            SocketStatusRegister::Established => {
-                self.receive(block, trans)?;
-                self.transmit(block, trans)?;
-
-                Ok(())
-            }
+            // Still connected and healthy — pull down any pending data first;
+            // only if nothing started asynchronously do we push staged tx data.
+            SocketStatusRegister::Established => match self.receive(block, trans, rings)? {
+                action @ BulkAction::Started { .. } => Ok(action),
+                BulkAction::None => self.transmit(block, trans, rings),
+            },
 
             // Peer initiated a graceful close (sent FIN). Keep draining the
-            // chip's RX buffer into our local ring; only close our side once
-            // every byte is off the chip (the consumer may still drain the
-            // local ring afterwards). If the ring is full we stay here and
-            // retry next tick once `read` frees space.
-            SocketStatusRegister::CloseWait => {
-                let pending = self.receive(block, trans)?;
+            // chip's RX buffer; only close our side once every byte is off the
+            // chip (the consumer may still drain the local ring afterwards).
+            SocketStatusRegister::CloseWait => match self.receive(block, trans, rings)? {
+                action @ BulkAction::Started { .. } => Ok(action),
+                BulkAction::None => {
+                    if get_rx_received_size(block, trans)? == 0 {
+                        send_sock_command(block, trans, SocketCommand::Disconnect)?;
+                        self.status = SocketStatus::Closing;
+                    }
 
-                if pending == 0 {
-                    send_sock_command(block, trans, SocketCommand::Disconnect)?;
-                    self.status = SocketStatus::Closing;
+                    Ok(BulkAction::None)
                 }
-
-                Ok(())
-            }
+            },
 
             // Connection already fully torn down.
             SocketStatusRegister::Closed => {
                 self.status = SocketStatus::Closed;
 
-                Ok(())
+                Ok(BulkAction::None)
             }
 
             // Any other state is unexpected for an established socket.
@@ -520,70 +495,81 @@ impl<'a> TcpSocketState<'a> {
         Ok(())
     }
 
-    /// Advance the state machine by one non-blocking tick.
+    /// Advance the state machine by one non-blocking tick. A swallowed (non
+    /// `WouldBlock`) error is stored and surfaced through `status`.
     pub(crate) fn run<D: SpiDmaDevice>(
         &mut self,
         block: &BlockAddress,
         trans: &Transceiver<D>,
-    ) -> Result<(), Error> {
-        self.store_error(|me| {
-            if me.close_requested {
-                return me.handle_close(block, trans);
-            }
-
-            match me.status {
-                SocketStatus::Init => me.handle_init(block, trans),
-                SocketStatus::Opening => me.handle_opening(block, trans),
-                SocketStatus::Connecting => me.handle_connecting(block, trans),
-                SocketStatus::Established => me.handle_established(block, trans),
-                SocketStatus::Listening => me.handle_listening(block, trans),
+        rings: &SocketRings,
+    ) -> Result<BulkAction, Error> {
+        let result = if self.close_requested {
+            self.handle_close(block, trans, rings).map(|()| BulkAction::None)
+        } else {
+            match self.status {
+                SocketStatus::Init => self.handle_init(block, trans).map(|()| BulkAction::None),
+                SocketStatus::Opening => {
+                    self.handle_opening(block, trans).map(|()| BulkAction::None)
+                }
+                SocketStatus::Connecting => {
+                    self.handle_connecting(block, trans).map(|()| BulkAction::None)
+                }
+                SocketStatus::Established => self.handle_established(block, trans, rings),
+                SocketStatus::Listening => {
+                    self.handle_listening(block, trans).map(|()| BulkAction::None)
+                }
                 SocketStatus::ClosingDueToError
                 | SocketStatus::ClosingDueToTimeout
-                | SocketStatus::Closing => me.handle_closing(block, trans),
+                | SocketStatus::Closing => {
+                    self.handle_closing(block, trans).map(|()| BulkAction::None)
+                }
 
-                SocketStatus::Timeout | SocketStatus::Closed | SocketStatus::Error => Ok(()),
+                SocketStatus::Timeout | SocketStatus::Closed | SocketStatus::Error => {
+                    Ok(BulkAction::None)
+                }
             }
-        })
+        };
+
+        match result {
+            Ok(action) => Ok(action),
+            Err(Error::WouldBlock) => Err(Error::WouldBlock),
+            e @ Err(_) => {
+                self.pending_error = e.err();
+                Ok(BulkAction::None)
+            }
+        }
     }
 }
 
-/// A lightweight, user-facing handle to a TCP socket. Holds only an atomic
-/// reference to the backend slot owned by the `W6100`; all chip I/O happens in
-/// `W6100::run`, so the handle's operations touch only the local ring buffers.
+/// A lightweight, user-facing handle to a TCP socket. Holds only a reference to
+/// the [`Socket`] slot owned by the `W6100`. `read`/`write` touch the lock-free
+/// rings directly (no cell); control ops (`status`/`close`/`reconnect`/`drop`)
+/// go through the protocol cell.
 pub struct TcpSocket<'a> {
-    backend: &'a AtomicCell<SocketBackend<'a>>,
+    socket: &'a Socket<'a>,
 }
 
 impl<'a> TcpSocket<'a> {
-    pub(crate) fn new(backend: &'a AtomicCell<SocketBackend<'a>>) -> Self {
-        Self { backend }
+    pub(crate) fn new(socket: &'a Socket<'a>) -> Self {
+        Self { socket }
     }
 
     /// Drain up to `dst.len()` bytes already received and buffered locally.
-    /// Returns the number copied (0 if nothing is buffered). Non-blocking.
+    /// Returns the number copied (0 if nothing is buffered). Lock-free,
+    /// non-blocking.
     pub fn read(&self, dst: &mut [u8]) -> Result<usize, Error> {
-        let mut guard = self.backend.lock_mut()?;
-
-        Ok(match guard.as_mut().as_tcp_mut() {
-            Some(tcp) => tcp.read(dst),
-            None => 0,
-        })
+        Ok(self.socket.rings.rx.read(dst))
     }
 
     /// Queue up to `src.len()` bytes for transmission, returning the number
-    /// accepted into the local tx ring. Non-blocking: the staged data is pushed
-    /// onto the chip and sent by `W6100::run`.
+    /// accepted into the local tx ring. Lock-free, non-blocking: the staged data
+    /// is pushed onto the chip and sent by `W6100::run`.
     pub fn write(&self, src: &[u8]) -> Result<usize, Error> {
-        let mut guard = self.backend.lock_mut()?;
-
-        Ok(match guard.as_mut().as_tcp_mut() {
-            Some(tcp) => tcp.write(src),
-            None => 0,
-        })
+        Ok(self.socket.rings.tx.write(src))
     }
 
     pub fn status(&self) -> Result<SocketStatus, Error> {
-        let mut guard = self.backend.lock_mut()?;
+        let mut guard = self.socket.backend.lock_mut()?;
 
         Ok(match guard.as_mut().as_tcp_mut() {
             Some(tcp) => tcp.status(),
@@ -595,7 +581,7 @@ impl<'a> TcpSocket<'a> {
     /// by the next `W6100::run` tick and the teardown completes asynchronously;
     /// poll [`status`](Self::status) for `Closed` to confirm.
     pub fn close(&self) -> Result<(), Error> {
-        let mut guard = self.backend.lock_mut()?;
+        let mut guard = self.socket.backend.lock_mut()?;
 
         if let Some(tcp) = guard.as_mut().as_tcp_mut() {
             tcp.request_close();
@@ -607,7 +593,7 @@ impl<'a> TcpSocket<'a> {
     /// Re-arm the socket so `W6100::run` re-opens and reconnects it. Use after a
     /// link-loss `reset` to bring the connection back up.
     pub fn reconnect(&self) -> Result<(), Error> {
-        let mut guard = self.backend.lock_mut()?;
+        let mut guard = self.socket.backend.lock_mut()?;
 
         if let Some(tcp) = guard.as_mut().as_tcp_mut() {
             tcp.rearm();
@@ -625,7 +611,7 @@ impl<'a> Drop for TcpSocket<'a> {
         // Single-threaded cooperative use means the cell is not held elsewhere
         // at drop time; if it somehow is, the slot is reclaimed on the next
         // `reset` instead.
-        if let Ok(mut guard) = self.backend.lock_mut() {
+        if let Ok(mut guard) = self.socket.backend.lock_mut() {
             guard.as_mut().request_release();
         }
     }

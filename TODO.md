@@ -51,8 +51,28 @@
       returns a `HalTransaction`; `wait()` blocks on the transfer, releases CS,
       and reconstructs `(HalSpi, DmaBuffers)`. `RxWindow`/`TxWindow` bound the DMA
       to the active `len`.
-- [ ] **Phase 2** — make the bulk payload genuinely async (start → return →
-      DMA-complete IRQ → finish), with one-in-flight coordination.
+- [x] **Phase 2** — the two bulk payload transfers are now genuinely async
+      (start → return → DMA-complete IRQ → finish), one-in-flight. Shape:
+      - `SpiDmaDevice::transceive` gained a `Completion::{Poll, Interrupt}` flag.
+        For `Interrupt` the app (`hal_spi.rs`) arms the SPI1_RX **TC interrupt**
+        (`rxchannel.listen`) *before* enabling the channel — no window where the
+        transfer could complete before the IRQ is armed — and disarms in `wait`
+        (clears `CTCIF2` + `unlisten`) so a stale flag can't storm the IRQ.
+      - `Transceiver` got a non-blocking bulk pair: `start_read`/`finish_read`
+        (closure delivers the captured window) and `start_write`/`finish_write`
+        (closure stages the payload), plus `abort` for teardown. `DmaState`
+        `Idle ↔ InFlight` is the seam.
+      - **Concurrency:** the rx/tx ring buffers were rewritten as a **lock-free
+        SPSC** (`spsc_ring.rs`) and moved *out* of the `AtomicCell`-guarded
+        socket state into a sibling `SocketRings`. `W6100::dma_complete` (called
+        from the app's `DMA1_CHANNEL2` ISR) delivers captured bytes into the rx
+        ring and commits the chip pointers **without ever taking a socket cell**,
+        so it cannot livelock against `main`'s handle ops.
+      - `W6100::run` records the in-flight transfer in `bulk: Option<BulkOp>`
+        (socket idx + kind + block + pointer + len) and stops; `service` defers
+        all SPI while `bulk` is `Some`; `reset` aborts an in-flight transfer.
+        `handle_close`'s flush stays synchronous so completion never mutates
+        `status`. **Not yet exercised on hardware** (build + host tests pass).
 
 ## Context
 

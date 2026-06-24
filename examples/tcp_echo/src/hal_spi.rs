@@ -22,16 +22,17 @@
 //!     `len` bytes the scratch slice is wrapped in `RxWindow`/`TxWindow`, which
 //!     report only the active `len` to the DMA.
 
+use cortex_m::peripheral::NVIC;
 use embedded_dma::{ReadBuffer, WriteBuffer};
 use embedded_hal::{delay::DelayNs, spi::ErrorKind};
 use stm32f1xx_hal::{
-    dma::{ReadWriteDma, Transfer, W, dma1},
+    dma::{Event, ReadWriteDma, Transfer, W, dma1},
     gpio::{Output, Pin},
     pac,
     spi::{Spi, Spi1RxTxDma},
 };
 
-use wiznet_rs::{DmaBuffers, SpiDmaDevice, SpiDmaTransaction};
+use wiznet_rs::{Completion, DmaBuffers, SpiDmaDevice, SpiDmaTransaction};
 
 const HEADER: usize = 3;
 const PAYLOAD: usize = 512;
@@ -82,9 +83,10 @@ impl SpiDmaDevice for HalSpi {
     fn transceive(
         self,
         buffers: DmaBuffers,
+        completion: Completion,
     ) -> Result<Self::Transaction, (Self::Error, Self, DmaBuffers)> {
         let HalSpi {
-            dma,
+            mut dma,
             mut cs,
             sysclk_hz,
         } = self;
@@ -92,8 +94,22 @@ impl SpiDmaDevice for HalSpi {
 
         // Clear any stale SPI1_RX transfer-complete flag before arming: `wait()`
         // treats "TCIF set" as done and the HAL's global-clear doesn't stick on
-        // this part, so a leftover flag would make `wait()` return early.
+        // this part, so a leftover flag would make `wait()` return early (and, in
+        // interrupt mode, fire the completion IRQ the instant it is armed).
         dma.rxchannel.ifcr().write(|w| w.ctcif2().set_bit());
+
+        // Arm (or leave disarmed) the DMA-complete interrupt *before* enabling
+        // the channel, so a completion can never race ahead of the arm. `wait`
+        // disarms again, so in poll mode TCIE is already clear here.
+        if completion == Completion::Interrupt {
+            #[allow(unsafe_code)]
+            // SAFETY: enabling the bulk-DMA completion interrupt; nothing relies
+            // on it being masked for a critical section.
+            unsafe {
+                NVIC::unmask(pac::Interrupt::DMA1_CHANNEL2);
+            }
+            dma.rxchannel.listen(Event::TransferComplete);
+        }
 
         cs.set_low();
         let transfer = dma.read_write(RxWindow { buf: rx, len }, TxWindow { buf: tx, len });
@@ -126,8 +142,15 @@ impl SpiDmaTransaction<HalSpi> for HalTransaction {
             len,
         } = self;
 
-        let ((rx_win, tx_win), dma) = transfer.wait();
+        let ((rx_win, tx_win), mut dma) = transfer.wait();
         cs.set_high();
+
+        // Disarm on completion: clear the channel TC flag and disable the TC
+        // interrupt. The HAL's global-clear (`stop`) doesn't reliably stick on
+        // this clone, so without this an interrupt-mode transfer would leave
+        // TCIF+TCIE set and storm the IRQ until the next transfer re-armed.
+        dma.rxchannel.ifcr().write(|w| w.ctcif2().set_bit());
+        dma.rxchannel.unlisten(Event::TransferComplete);
 
         (
             HalSpi {
