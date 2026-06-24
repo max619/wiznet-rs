@@ -5,6 +5,25 @@
     "version": "0.2.0",
     "configurations": [
         {
+            "preLaunchTask": "cargo build example: spi_dma_loopback",
+            "type": "probe-rs-debug",
+            "request": "launch",
+            "name": "Debug example: spi_dma_loopback",
+            "cwd": "${workspaceFolder}",
+            "connectUnderReset": true,
+            "chip": "STM32F103C8Tx",
+            "flashingConfig": {
+                "flashingEnabled": true,
+                "haltAfterReset": true
+            },
+            "coreConfigs": [
+                {
+                    "coreIndex": 0,
+                    "programBinary": "${workspaceFolder}/target/thumbv7m-none-eabi/debug/examples/spi_dma_loopback"
+                }
+            ]
+        },
+        {
             "preLaunchTask": "rust: cargo build",
             "type": "probe-rs-debug",
             "request": "launch",

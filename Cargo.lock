@@ -292,6 +292,7 @@ dependencies = [
  "bitflags 2.13.0",
  "cortex-m",
  "cortex-m-rt",
+ "embedded-dma",
  "embedded-hal 1.0.0",
  "embedded-hal-bus",
  "nb 1.1.0",

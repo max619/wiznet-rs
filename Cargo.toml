@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 embedded-hal = "1.0"
 embedded-hal-bus = "0.3"
+embedded-dma = "0.2"
 nb = "1"
 cortex-m = "0.7.7"
 cortex-m-rt = "0.7.5"
@@ -20,7 +21,7 @@ features = ["stm32f103"]
 
 # Your own crate: unoptimized, full debug info — fully debuggable.
 [profile.dev]
-opt-level = 1
+opt-level = 0
 debug = true
 
 # All dependencies: optimize for size and drop their debug info. This is what
