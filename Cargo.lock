@@ -395,4 +395,5 @@ dependencies = [
  "embedded-dma",
  "embedded-hal 1.0.0",
  "embedded-hal-bus",
+ "nb 1.1.0",
 ]

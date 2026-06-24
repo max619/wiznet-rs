@@ -10,8 +10,11 @@ use embedded_hal::{
 };
 
 mod error;
+pub use error::{DriverError, Error};
 
 mod atomic_cell;
+use crate::error::DriverError::{PinError, SpiError};
+
 use self::atomic_cell::{AtomicCell, AtomicError, AtomicMutLock};
 
 mod transiver;
@@ -164,19 +167,9 @@ pub struct W6100<'a, Spi: SpiDevice<u8> + SpiDma, RstPin: OutputPin> {
     sockets: [AtomicCell<SocketBackend<'a>>; 8],
 }
 
-#[derive(Debug, Clone, Copy)]
-pub enum Error {
-    SpiError,
-    PinError,
-
-    UnexpectedResponse,
-
-    Busy,
-}
-
 impl From<AtomicError> for Error {
     fn from(_: AtomicError) -> Self {
-        Error::Busy
+        Error::WouldBlock
     }
 }
 
@@ -187,7 +180,7 @@ impl<Spi: SpiDevice<u8> + SpiDma> Transceiver for Transport<Spi> {
                 Operation::Write(&header(addr, false)),
                 Operation::Read(data),
             ])
-            .map_err(|_| Error::SpiError)
+            .map_err(|_| Error::Other(SpiError))
     }
 
     fn write(&mut self, addr: &Address, data: &[u8]) -> Result<(), Error> {
@@ -196,7 +189,7 @@ impl<Spi: SpiDevice<u8> + SpiDma> Transceiver for Transport<Spi> {
                 Operation::Write(&header(addr, true)),
                 Operation::Write(data),
             ])
-            .map_err(|_| Error::SpiError)
+            .map_err(|_| Error::Other(SpiError))
     }
 
     fn bulk_read(&mut self, addr: &Address, dst: &mut [u8]) -> Result<(), Error> {
@@ -289,22 +282,22 @@ impl<'a, Spi: SpiDevice<u8> + SpiDma, RstPin: OutputPin> W6100<'a, Spi, RstPin> 
         let mut dev_guard = self.device.lock_mut()?;
         let device = dev_guard.as_mut();
 
-        device.rst.set_low().map_err(|_| Error::PinError)?;
+        device.rst.set_low().map_err(|_| Error::Other(PinError))?;
 
         device
             .transport
             .spi
             .transaction(&mut [Operation::DelayNs(1_000_000)])
-            .map_err(|_| Error::SpiError)?;
+            .map_err(|_| Error::Other(SpiError))?;
 
-        device.rst.set_high().map_err(|_| Error::PinError)?;
+        device.rst.set_high().map_err(|_| Error::Other(PinError))?;
 
         if device.transport.read_u16(&CIDR)? != 0x6100 {
-            return Err(Error::UnexpectedResponse);
+            return Err(Error::Other(DriverError::UnexpectedResponse));
         }
 
         if device.transport.read_u16(&VER)? != 0x4661 {
-            return Err(Error::UnexpectedResponse);
+            return Err(Error::Other(DriverError::UnexpectedResponse));
         }
 
         for cell in self.sockets.iter() {
@@ -386,7 +379,7 @@ impl<'a, Spi: SpiDevice<u8> + SpiDma, RstPin: OutputPin> W6100<'a, Spi, RstPin> 
             }
         }
 
-        Err(Error::Busy)
+        Err(Error::WouldBlock)
     }
 
     /// Open a TCP socket that passively listens on `port`. As with
@@ -414,7 +407,7 @@ impl<'a, Spi: SpiDevice<u8> + SpiDma, RstPin: OutputPin> W6100<'a, Spi, RstPin> 
             }
         }
 
-        Err(Error::Busy)
+        Err(Error::WouldBlock)
     }
 
     pub fn run(&self) -> Result<(), Error> {
@@ -430,7 +423,7 @@ impl<'a, Spi: SpiDevice<u8> + SpiDma, RstPin: OutputPin> W6100<'a, Spi, RstPin> 
 
             match guard.as_mut().run(&mut device.transport) {
                 Ok(()) => (),
-                Err(Error::Busy) => (),
+                Err(Error::WouldBlock) => (),
                 Err(e) => return Err(e),
             }
         }

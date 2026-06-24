@@ -1,5 +1,5 @@
 use crate::{
-    Error,
+    DriverError, Error,
     atomic_cell::{AtomicCell, AtomicMutLock},
     ring_buffer::RingBuffer,
     socket::{SocketBackend, SocketProtocolMode, SocketStatus},
@@ -128,7 +128,7 @@ impl<'a> TcpSocketState<'a> {
         match f(self) {
             Ok(_) => Ok(()),
             Err(e) => match e {
-                Error::Busy => Err(Error::Busy),
+                Error::WouldBlock => Err(Error::WouldBlock),
                 e => {
                     self.pending_error = Some(e);
                     Ok(())
@@ -244,7 +244,7 @@ impl<'a> TcpSocketState<'a> {
                 send_sock_command(block, trans, SocketCommand::Close)?;
                 self.status = SocketStatus::ClosingDueToError;
 
-                Err(Error::UnexpectedResponse)
+                Err(Error::Other(DriverError::UnexpectedResponse))
             }
         }
     }
@@ -291,7 +291,7 @@ impl<'a> TcpSocketState<'a> {
                 send_sock_command(block, trans, SocketCommand::Close)?;
                 self.status = SocketStatus::ClosingDueToError;
 
-                Err(Error::UnexpectedResponse)
+                Err(Error::Other(DriverError::UnexpectedResponse))
             }
         }
     }
@@ -334,7 +334,7 @@ impl<'a> TcpSocketState<'a> {
                 send_sock_command(block, trans, SocketCommand::Close)?;
                 self.status = SocketStatus::ClosingDueToError;
 
-                Err(Error::UnexpectedResponse)
+                Err(Error::Other(DriverError::UnexpectedResponse))
             }
         }
     }
@@ -498,7 +498,7 @@ impl<'a> TcpSocketState<'a> {
                 send_sock_command(block, trans, SocketCommand::Close)?;
                 self.status = SocketStatus::ClosingDueToError;
 
-                Err(Error::UnexpectedResponse)
+                Err(Error::Other(DriverError::UnexpectedResponse))
             }
         }
     }
