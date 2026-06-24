@@ -1,4 +1,4 @@
-use crate::w6100::{
+use crate::{
     Error,
     atomic_cell::{AtomicCell, AtomicMutLock},
     ring_buffer::RingBuffer,

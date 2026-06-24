@@ -1,4 +1,4 @@
-use crate::w6100::{
+use crate::{
     Error,
     socket::SocketProtocolMode,
     transiver::{Address, BlockAddress, Transceiver},

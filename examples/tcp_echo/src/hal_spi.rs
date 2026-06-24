@@ -27,7 +27,7 @@ use stm32f1xx_hal::{
     spi::{Spi, Spi1RxTxDma},
 };
 
-use crate::w6100::{Error, SpiDma};
+use wiznet_rs::{Error, SpiDma};
 
 const HEADER: usize = 3;
 const PAYLOAD: usize = 512;
@@ -89,11 +89,18 @@ impl HalSpi {
         // Clear any stale SPI1_RX transfer-complete flag before arming: `wait()`
         // treats "TCIF set" as done and the HAL's global-clear doesn't stick on
         // this part, so a leftover flag would make `wait()` return early.
-        clear_spi1_rx_tc();
 
         let dma = self.dma.take().expect("dma present between transfers");
-        let mut rx = self.rx_scratch.take().expect("rx scratch present between transfers");
-        let mut tx = self.tx_scratch.take().expect("tx scratch present between transfers");
+        Self::clear_rx_tc(&dma);
+
+        let mut rx = self
+            .rx_scratch
+            .take()
+            .expect("rx scratch present between transfers");
+        let mut tx = self
+            .tx_scratch
+            .take()
+            .expect("tx scratch present between transfers");
         rx.len = n;
         tx.len = n;
 
@@ -101,6 +108,16 @@ impl HalSpi {
         self.dma = Some(dma);
         self.rx_scratch = Some(buffers.0);
         self.tx_scratch = Some(buffers.1);
+    }
+
+    /// Clear the SPI1_RX (DMA1 channel 2) transfer-complete flag.
+    ///
+    /// stm32f1xx-hal 0.11 has no per-channel event-clear, and the channel is owned
+    /// inside `Spi1RxTxDma`, so we write the channel-specific `CTCIF2` bit directly.
+    /// This is deliberately the *channel*-specific clear, not the HAL's global one,
+    /// which doesn't reliably stick on this clone MCU.
+    fn clear_rx_tc(dma: &Spi1RxTxDma) {
+        dma.rxchannel.ifcr().write(|w| w.ctcif2().set_bit());
     }
 }
 
@@ -217,20 +234,5 @@ unsafe impl ReadBuffer for DmaBuf {
     type Word = u8;
     unsafe fn read_buffer(&self) -> (*const u8, usize) {
         (self.data.as_ptr(), self.len)
-    }
-}
-
-/// Clear the SPI1_RX (DMA1 channel 2) transfer-complete flag.
-///
-/// stm32f1xx-hal 0.11 has no per-channel event-clear, and the channel is owned
-/// inside `Spi1RxTxDma`, so we write the channel-specific `CTCIF2` bit directly.
-/// This is deliberately the *channel*-specific clear, not the HAL's global one,
-/// which doesn't reliably stick on this clone MCU.
-fn clear_spi1_rx_tc() {
-    #[allow(unsafe_code)]
-    // SAFETY: DMA1 is a singleton; `CTCIF2` is a write-1-to-clear status bit with
-    // no aliasing or ownership effect on memory.
-    unsafe {
-        (*pac::DMA1::ptr()).ifcr().write(|w| w.ctcif2().set_bit());
     }
 }

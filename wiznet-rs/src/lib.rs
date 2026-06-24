@@ -1,3 +1,6 @@
+#![deny(unsafe_code)]
+#![no_std]
+
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use bitflags::bitflags;
@@ -5,6 +8,8 @@ use embedded_hal::{
     digital::OutputPin,
     spi::{Operation, SpiDevice},
 };
+
+mod error;
 
 mod atomic_cell;
 use self::atomic_cell::{AtomicCell, AtomicError, AtomicMutLock};
@@ -14,8 +19,8 @@ pub use self::transiver::SpiDma;
 use self::transiver::{Address, BlockAddress, BlockSelectionBits, Transceiver, header};
 
 mod socket;
-pub use self::socket::SocketStatus;
 use self::socket::SocketBackend;
+pub use self::socket::SocketStatus;
 
 mod socket_common;
 
@@ -178,13 +183,19 @@ impl From<AtomicError> for Error {
 impl<Spi: SpiDevice<u8> + SpiDma> Transceiver for Transport<Spi> {
     fn read(&mut self, addr: &Address, data: &mut [u8]) -> Result<(), Error> {
         self.spi
-            .transaction(&mut [Operation::Write(&header(addr, false)), Operation::Read(data)])
+            .transaction(&mut [
+                Operation::Write(&header(addr, false)),
+                Operation::Read(data),
+            ])
             .map_err(|_| Error::SpiError)
     }
 
     fn write(&mut self, addr: &Address, data: &[u8]) -> Result<(), Error> {
         self.spi
-            .transaction(&mut [Operation::Write(&header(addr, true)), Operation::Write(data)])
+            .transaction(&mut [
+                Operation::Write(&header(addr, true)),
+                Operation::Write(data),
+            ])
             .map_err(|_| Error::SpiError)
     }
 
@@ -342,8 +353,10 @@ impl<'a, Spi: SpiDevice<u8> + SpiDma, RstPin: OutputPin> W6100<'a, Spi, RstPin> 
         let status =
             PHYStatusFlags::from_bits_retain(dev_guard.as_mut().transport.read_u8(&PHYSR)?);
 
-        Ok((status & PHYStatusFlags::CAB_MASK) == PHYStatusFlags::CAB_ON
-            && (status & PHYStatusFlags::LINK_MASK) == PHYStatusFlags::LINK_UP)
+        Ok(
+            (status & PHYStatusFlags::CAB_MASK) == PHYStatusFlags::CAB_ON
+                && (status & PHYStatusFlags::LINK_MASK) == PHYStatusFlags::LINK_UP,
+        )
     }
 
     /// Open a TCP socket that actively connects to `addr:port` from `src_port`.
@@ -392,7 +405,9 @@ impl<'a, Spi: SpiDevice<u8> + SpiDma, RstPin: OutputPin> W6100<'a, Spi, RstPin> 
             };
 
             if guard.as_mut().is_free() {
-                guard.as_mut().claim_tcp(TcpSocketState::listen(port, rx, tx));
+                guard
+                    .as_mut()
+                    .claim_tcp(TcpSocketState::listen(port, rx, tx));
                 drop(guard);
 
                 return Ok(TcpSocket::new(cell));
@@ -435,7 +450,10 @@ impl<'a, Spi: SpiDevice<u8> + SpiDma, RstPin: OutputPin> W6100<'a, Spi, RstPin> 
     }
 
     fn network_config(&self) -> Option<NetworkConfig> {
-        self.config.lock_mut().ok().and_then(|guard| *guard.as_ref())
+        self.config
+            .lock_mut()
+            .ok()
+            .and_then(|guard| *guard.as_ref())
     }
 
     /// The PHY link state most recently observed by `service` (cached, no SPI).

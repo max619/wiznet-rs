@@ -18,9 +18,9 @@ use stm32f1xx_hal::{
 };
 
 mod hal_spi;
-mod w6100;
+
 use crate::hal_spi::{HalSpi, SCRATCH};
-use crate::w6100::{NetworkConfig, SocketStatus, TcpSocket, W6100};
+use wiznet_rs::{NetworkConfig, SocketStatus, TcpSocket, W6100};
 
 // Concrete types of the fully-configured chip, needed to name the `'static`
 // singleton storage and the interrupt-shared globals.
@@ -100,9 +100,8 @@ fn main() -> ! {
         sysclk_hz,
     );
 
-    let chip: &'static Chip = CHIP_CELL.init(
-        W6100::new(hal_spi, rst, mac).expect("Failed to init W6100"),
-    );
+    let chip: &'static Chip =
+        CHIP_CELL.init(W6100::new(hal_spi, rst, mac).expect("Failed to init W6100"));
 
     // Periodic 1 ms tick: drives the non-interrupt transitions (handshake/close
     // polling, TX flush) and backstops any missed INT edge.

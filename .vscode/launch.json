@@ -24,10 +24,10 @@
             ]
         },
         {
-            "preLaunchTask": "rust: cargo build",
+            "preLaunchTask": "cargo build example: tcp_echo",
             "type": "probe-rs-debug",
             "request": "launch",
-            "name": "probe-rs Test",
+            "name": "probe-rs Test: tcp_echo",
             "cwd": "${workspaceFolder}",
             "connectUnderReset": false,
             "chip": "STM32F103C8Tx",
@@ -38,7 +38,7 @@
             "coreConfigs": [
                 {
                     "coreIndex": 0,
-                    "programBinary": "${workspaceFolder}/target/thumbv7m-none-eabi/debug/stm32_rust"
+                    "programBinary": "${workspaceFolder}/target/thumbv7m-none-eabi/debug/tcp_echo"
                 }
             ]
         }

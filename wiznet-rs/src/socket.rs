@@ -1,6 +1,6 @@
 use bitflags::bitflags;
 
-use crate::w6100::{
+use crate::{
     Error,
     socket_common::init_socket,
     tcp_socket::TcpSocketState,

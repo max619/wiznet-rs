@@ -8,6 +8,14 @@
             "args": ["build", "--example", "spi_dma_loopback"],
             "problemMatcher": ["$rustc"],
             "group": "build"
+        },
+        {
+            "label": "cargo build example: tcp_echo",
+            "type": "shell",
+            "command": "cargo",
+            "args": ["build", "-p", "tcp_echo"],
+            "problemMatcher": ["$rustc"],
+            "group": "build"
         }
     ]
 }

@@ -1,4 +1,4 @@
-use crate::w6100::Error;
+use crate::Error;
 
 #[derive(Clone, Copy)]
 pub enum BlockSelectionBits {
