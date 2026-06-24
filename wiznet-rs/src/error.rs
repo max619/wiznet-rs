@@ -3,6 +3,8 @@ pub enum DriverError {
     SpiError,
     PinError,
 
+    ScratchBufferOverrun,
+
     UnexpectedResponse,
 }
 

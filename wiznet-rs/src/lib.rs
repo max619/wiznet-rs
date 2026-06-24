@@ -17,9 +17,11 @@ use crate::error::DriverError::{PinError, SpiError};
 
 use self::atomic_cell::{AtomicCell, AtomicError, AtomicMutLock};
 
+mod spi_dma;
+pub use spi_dma::*;
+
 mod transiver;
-pub use self::transiver::SpiDma;
-use self::transiver::{Address, BlockAddress, BlockSelectionBits, Transceiver, header};
+use self::transiver::{Address, BlockAddress, BlockSelectionBits, Transceiver, create_header};
 
 mod socket;
 use self::socket::SocketBackend;
@@ -133,15 +135,11 @@ bitflags! {
 
 pub type MacAddress = [u8; 6];
 
-pub struct Transport<Spi: SpiDevice<u8>> {
-    spi: Spi,
-}
-
 /// The chip's shared hardware: the SPI transport and the reset pin. Kept behind
 /// an `AtomicCell` so the user-facing socket handles (which borrow the `W6100`)
 /// can coexist with `&self` driver methods that need exclusive hardware access.
-struct Device<Spi: SpiDevice<u8>, RstPin: OutputPin> {
-    transport: Transport<Spi>,
+struct Device<Spi: SpiDmaDevice, RstPin: OutputPin> {
+    transport: Transceiver<Spi>,
     rst: RstPin,
 }
 
@@ -154,7 +152,7 @@ pub struct NetworkConfig {
     pub subnet: u32,
 }
 
-pub struct W6100<'a, Spi: SpiDevice<u8> + SpiDma, RstPin: OutputPin> {
+pub struct W6100<'a, Spi: SpiDmaDevice, RstPin: OutputPin> {
     device: AtomicCell<Device<Spi, RstPin>>,
     mac: MacAddress,
 
@@ -173,43 +171,6 @@ impl From<AtomicError> for Error {
     }
 }
 
-impl<Spi: SpiDevice<u8> + SpiDma> Transceiver for Transport<Spi> {
-    fn read(&mut self, addr: &Address, data: &mut [u8]) -> Result<(), Error> {
-        self.spi
-            .transaction(&mut [
-                Operation::Write(&header(addr, false)),
-                Operation::Read(data),
-            ])
-            .map_err(|_| Error::Other(SpiError))
-    }
-
-    fn write(&mut self, addr: &Address, data: &[u8]) -> Result<(), Error> {
-        self.spi
-            .transaction(&mut [
-                Operation::Write(&header(addr, true)),
-                Operation::Write(data),
-            ])
-            .map_err(|_| Error::Other(SpiError))
-    }
-
-    fn bulk_read(&mut self, addr: &Address, dst: &mut [u8]) -> Result<(), Error> {
-        // Blocking for now: kick off the DMA read and immediately wait. Phase 2
-        // moves the `finish` to the completion interrupt.
-        self.spi.start_read(&header(addr, false), dst.len())?;
-        self.spi.finish()?;
-
-        let received = self.spi.read_buffer();
-        dst.copy_from_slice(&received[..dst.len()]);
-
-        Ok(())
-    }
-
-    fn bulk_write(&mut self, addr: &Address, data: &[u8]) -> Result<(), Error> {
-        self.spi.start_write(&header(addr, true), data)?;
-        self.spi.finish()
-    }
-}
-
 /// Build one socket backend cell for the given register/buffer block selectors.
 fn backend_cell<'a>(
     reg: BlockSelectionBits,
@@ -219,11 +180,16 @@ fn backend_cell<'a>(
     AtomicCell::new(SocketBackend::new(BlockAddress { reg, tx, rx }))
 }
 
-impl<'a, Spi: SpiDevice<u8> + SpiDma, RstPin: OutputPin> W6100<'a, Spi, RstPin> {
-    pub fn new(spi: Spi, rst: RstPin, mac: MacAddress) -> Result<Self, Error> {
+impl<'a, Spi: SpiDmaDevice, RstPin: OutputPin> W6100<'a, Spi, RstPin> {
+    pub fn new(
+        spi: Spi,
+        rst: RstPin,
+        scratch_buffers: DmaBuffers,
+        mac: MacAddress,
+    ) -> Result<Self, Error> {
         let this = W6100 {
             device: AtomicCell::new(Device {
-                transport: Transport { spi },
+                transport: Transceiver::new(spi, scratch_buffers),
                 rst,
             }),
             mac,
@@ -286,7 +252,6 @@ impl<'a, Spi: SpiDevice<u8> + SpiDma, RstPin: OutputPin> W6100<'a, Spi, RstPin> 
 
         device
             .transport
-            .spi
             .transaction(&mut [Operation::DelayNs(1_000_000)])
             .map_err(|_| Error::Other(SpiError))?;
 

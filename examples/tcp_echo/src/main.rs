@@ -20,7 +20,7 @@ use stm32f1xx_hal::{
 mod hal_spi;
 
 use crate::hal_spi::{HalSpi, SCRATCH};
-use wiznet_rs::{NetworkConfig, SocketStatus, TcpSocket, W6100};
+use wiznet_rs::{DmaBuffers, NetworkConfig, SocketStatus, TcpSocket, W6100};
 
 // Concrete types of the fully-configured chip, needed to name the `'static`
 // singleton storage and the interrupt-shared globals.
@@ -90,18 +90,18 @@ fn main() -> ! {
     static RX_SCRATCH: StaticCell<[u8; SCRATCH]> = StaticCell::new();
     static TX_SCRATCH: StaticCell<[u8; SCRATCH]> = StaticCell::new();
 
-    let hal_spi = HalSpi::new(
-        spi,
-        dma1.2,
-        dma1.3,
-        cs,
-        RX_SCRATCH.init([0u8; SCRATCH]),
-        TX_SCRATCH.init([0u8; SCRATCH]),
-        sysclk_hz,
-    );
+    let hal_spi = HalSpi::new(spi, dma1.2, dma1.3, cs, sysclk_hz);
+
+    // Scratch buffers for the driver's DMA transport (header + payload per
+    // transfer). The library owns them; the transport borrows them per transfer.
+    let scratch = DmaBuffers {
+        rx: RX_SCRATCH.init([0u8; SCRATCH]),
+        tx: TX_SCRATCH.init([0u8; SCRATCH]),
+        len: 0,
+    };
 
     let chip: &'static Chip =
-        CHIP_CELL.init(W6100::new(hal_spi, rst, mac).expect("Failed to init W6100"));
+        CHIP_CELL.init(W6100::new(hal_spi, rst, scratch, mac).expect("Failed to init W6100"));
 
     // Periodic 1 ms tick: drives the non-interrupt transitions (handshake/close
     // polling, TX flush) and backstops any missed INT edge.

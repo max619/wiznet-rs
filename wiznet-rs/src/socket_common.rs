@@ -1,5 +1,5 @@
 use crate::{
-    Error,
+    Error, SpiDmaDevice,
     socket::SocketProtocolMode,
     transiver::{Address, BlockAddress, Transceiver},
 };
@@ -266,9 +266,9 @@ pub(crate) enum SocketStatusRegister {
     Unknown = 0xFF,
 }
 
-pub(crate) fn init_socket<Trans: Transceiver>(
+pub(crate) fn init_socket<D: SpiDmaDevice>(
     block: &BlockAddress,
-    trans: &mut Trans,
+    trans: &Transceiver<D>,
     mode: SocketProtocolMode,
 ) -> Result<(), Error> {
     trans.write_u8(
@@ -300,9 +300,9 @@ pub(crate) fn init_socket<Trans: Transceiver>(
     Ok(())
 }
 
-pub(crate) fn get_interrupts<Trans: Transceiver>(
+pub(crate) fn get_interrupts<D: SpiDmaDevice>(
     block: &BlockAddress,
-    trans: &mut Trans,
+    trans: &Transceiver<D>,
 ) -> Result<SocketInterrupt, Error> {
     let ir = trans.read_u8(&Address {
         address: SN_IR,
@@ -312,9 +312,9 @@ pub(crate) fn get_interrupts<Trans: Transceiver>(
     Ok(SocketInterrupt::from_bits_truncate(ir))
 }
 
-pub(crate) fn clear_interrupts<Trans: Transceiver>(
+pub(crate) fn clear_interrupts<D: SpiDmaDevice>(
     block: &BlockAddress,
-    trans: &mut Trans,
+    trans: &Transceiver<D>,
     mask: SocketInterrupt,
 ) -> Result<(), Error> {
     trans.write_u8(
@@ -326,9 +326,9 @@ pub(crate) fn clear_interrupts<Trans: Transceiver>(
     )
 }
 
-pub(crate) fn set_src_port<Trans: Transceiver>(
+pub(crate) fn set_src_port<D: SpiDmaDevice>(
     block: &BlockAddress,
-    trans: &mut Trans,
+    trans: &Transceiver<D>,
     port: u16,
 ) -> Result<(), Error> {
     trans.write_u16(
@@ -340,9 +340,9 @@ pub(crate) fn set_src_port<Trans: Transceiver>(
     )
 }
 
-pub(crate) fn set_dst_port<Trans: Transceiver>(
+pub(crate) fn set_dst_port<D: SpiDmaDevice>(
     block: &BlockAddress,
-    trans: &mut Trans,
+    trans: &Transceiver<D>,
     port: u16,
 ) -> Result<(), Error> {
     trans.write_u16(
@@ -354,9 +354,9 @@ pub(crate) fn set_dst_port<Trans: Transceiver>(
     )
 }
 
-pub(crate) fn set_ipv4_dst_addr<Trans: Transceiver>(
+pub(crate) fn set_ipv4_dst_addr<D: SpiDmaDevice>(
     block: &BlockAddress,
-    trans: &mut Trans,
+    trans: &Transceiver<D>,
     address: u32,
 ) -> Result<(), Error> {
     trans.write_u32(
@@ -368,9 +368,9 @@ pub(crate) fn set_ipv4_dst_addr<Trans: Transceiver>(
     )
 }
 
-pub(crate) fn send_sock_command<Trans: Transceiver>(
+pub(crate) fn send_sock_command<D: SpiDmaDevice>(
     block: &BlockAddress,
-    trans: &mut Trans,
+    trans: &Transceiver<D>,
     command: SocketCommand,
 ) -> Result<(), Error> {
     trans.write_u8(
@@ -383,9 +383,9 @@ pub(crate) fn send_sock_command<Trans: Transceiver>(
 }
 
 /// Number of bytes currently waiting in the SOCKET's RX buffer on the chip.
-pub(crate) fn get_rx_received_size<Trans: Transceiver>(
+pub(crate) fn get_rx_received_size<D: SpiDmaDevice>(
     block: &BlockAddress,
-    trans: &mut Trans,
+    trans: &Transceiver<D>,
 ) -> Result<u16, Error> {
     trans.read_u16(&Address {
         address: SN_RX_RSR0,
@@ -394,9 +394,9 @@ pub(crate) fn get_rx_received_size<Trans: Transceiver>(
 }
 
 /// Current RX read pointer (Sn_RX_RD) — a free-running 16-bit offset.
-pub(crate) fn get_rx_read_pointer<Trans: Transceiver>(
+pub(crate) fn get_rx_read_pointer<D: SpiDmaDevice>(
     block: &BlockAddress,
-    trans: &mut Trans,
+    trans: &Transceiver<D>,
 ) -> Result<u16, Error> {
     trans.read_u16(&Address {
         address: SN_RX_RD0,
@@ -405,9 +405,9 @@ pub(crate) fn get_rx_read_pointer<Trans: Transceiver>(
 }
 
 /// Advance the RX read pointer (Sn_RX_RD) after consuming data.
-pub(crate) fn set_rx_read_pointer<Trans: Transceiver>(
+pub(crate) fn set_rx_read_pointer<D: SpiDmaDevice>(
     block: &BlockAddress,
-    trans: &mut Trans,
+    trans: &Transceiver<D>,
     pointer: u16,
 ) -> Result<(), Error> {
     trans.write_u16(
@@ -421,13 +421,13 @@ pub(crate) fn set_rx_read_pointer<Trans: Transceiver>(
 
 /// Burst-read `data.len()` bytes out of the SOCKET's RX buffer starting at the
 /// given pointer. The chip auto-increments and wraps within the buffer region.
-pub(crate) fn read_rx_buffer<Trans: Transceiver>(
+pub(crate) fn read_rx_buffer<D: SpiDmaDevice>(
     block: &BlockAddress,
-    trans: &mut Trans,
+    trans: &Transceiver<D>,
     pointer: u16,
     data: &mut [u8],
 ) -> Result<(), Error> {
-    trans.bulk_read(
+    trans.read(
         &Address {
             address: pointer,
             block: block.rx,
@@ -437,9 +437,9 @@ pub(crate) fn read_rx_buffer<Trans: Transceiver>(
 }
 
 /// Free space (in bytes) currently available in the SOCKET's TX buffer.
-pub(crate) fn get_tx_free_size<Trans: Transceiver>(
+pub(crate) fn get_tx_free_size<D: SpiDmaDevice>(
     block: &BlockAddress,
-    trans: &mut Trans,
+    trans: &Transceiver<D>,
 ) -> Result<u16, Error> {
     trans.read_u16(&Address {
         address: SN_TX_FSR0,
@@ -448,9 +448,9 @@ pub(crate) fn get_tx_free_size<Trans: Transceiver>(
 }
 
 /// Current TX write pointer (Sn_TX_WR) — a free-running 16-bit offset.
-pub(crate) fn get_tx_write_pointer<Trans: Transceiver>(
+pub(crate) fn get_tx_write_pointer<D: SpiDmaDevice>(
     block: &BlockAddress,
-    trans: &mut Trans,
+    trans: &Transceiver<D>,
 ) -> Result<u16, Error> {
     trans.read_u16(&Address {
         address: SN_TX_WR0,
@@ -459,9 +459,9 @@ pub(crate) fn get_tx_write_pointer<Trans: Transceiver>(
 }
 
 /// Advance the TX write pointer (Sn_TX_WR) after staging data to send.
-pub(crate) fn set_tx_write_pointer<Trans: Transceiver>(
+pub(crate) fn set_tx_write_pointer<D: SpiDmaDevice>(
     block: &BlockAddress,
-    trans: &mut Trans,
+    trans: &Transceiver<D>,
     pointer: u16,
 ) -> Result<(), Error> {
     trans.write_u16(
@@ -475,13 +475,13 @@ pub(crate) fn set_tx_write_pointer<Trans: Transceiver>(
 
 /// Burst-write `data.len()` bytes into the SOCKET's TX buffer starting at the
 /// given pointer. The chip auto-increments and wraps within the buffer region.
-pub(crate) fn write_tx_buffer<Trans: Transceiver>(
+pub(crate) fn write_tx_buffer<D: SpiDmaDevice>(
     block: &BlockAddress,
-    trans: &mut Trans,
+    trans: &Transceiver<D>,
     pointer: u16,
     data: &[u8],
 ) -> Result<(), Error> {
-    trans.bulk_write(
+    trans.write(
         &Address {
             address: pointer,
             block: block.tx,
@@ -490,9 +490,9 @@ pub(crate) fn write_tx_buffer<Trans: Transceiver>(
     )
 }
 
-pub(crate) fn is_command_pending<Trans: Transceiver>(
+pub(crate) fn is_command_pending<D: SpiDmaDevice>(
     block: &BlockAddress,
-    trans: &mut Trans,
+    trans: &Transceiver<D>,
 ) -> Result<bool, Error> {
     Ok(trans.read_u8(&Address {
         address: SN_CR,
@@ -500,9 +500,9 @@ pub(crate) fn is_command_pending<Trans: Transceiver>(
     })? != 0)
 }
 
-pub(crate) fn read_status<Trans: Transceiver>(
+pub(crate) fn read_status<D: SpiDmaDevice>(
     block: &BlockAddress,
-    trans: &mut Trans,
+    trans: &Transceiver<D>,
 ) -> Result<SocketStatusRegister, Error> {
     let value = trans.read_u8(&Address {
         address: SN_SR,

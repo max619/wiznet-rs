@@ -1,4 +1,11 @@
-use crate::Error;
+use core::mem;
+
+use embedded_hal::spi::Operation;
+
+use crate::{
+    DmaBuffers, DriverError, Error, SpiDmaDevice, SpiDmaTransaction,
+    atomic_cell::{AtomicCell, AtomicMutLock},
+};
 
 #[derive(Clone, Copy)]
 pub enum BlockSelectionBits {
@@ -50,38 +57,16 @@ pub struct Address {
 
 /// Build the 3-byte W6100 SPI command header for `addr`. `write` selects the
 /// RWB bit; OM is left 0 (variable-length mode).
-pub(crate) fn header(addr: &Address, write: bool) -> [u8; 3] {
+pub(crate) fn create_header(addr: &Address, write: bool) -> [u8; 3] {
     let mut h = [0u8; 3];
     h[0..2].copy_from_slice(&addr.address.to_be_bytes());
     h[2] = ((addr.block as u8) << 3) | if write { 0b100 } else { 0 };
     h
 }
 
-/// Async DMA capability for the SPI link, kept deliberately platform-close: it
-/// moves an opaque `header` (clocked out blocking) plus a DMA payload, manages
-/// CS across the transfer, and owns its own scratch. No W6100 concepts here.
-///
-/// Completion is signalled out-of-band (the platform's DMA interrupt), after
-/// which [`finish`](Self::finish) reclaims the bus.
-pub trait SpiDma {
-    /// Clock out `header`, then DMA-read `len` payload bytes into internal scratch.
-    fn start_read(&mut self, header: &[u8], len: usize) -> Result<(), Error>;
-
-    /// Clock out `header`, then DMA-write `data` (copied internally before return).
-    fn start_write(&mut self, header: &[u8], data: &[u8]) -> Result<(), Error>;
-
-    /// Wait for the in-flight transfer to finish (instant when called from the
-    /// completion interrupt), release CS, and free the bus. No-op if idle.
-    fn finish(&mut self) -> Result<(), Error>;
-
-    /// The payload captured by the most recent [`start_read`](Self::start_read),
-    /// valid once [`finish`](Self::finish) has run.
-    fn read_buffer(&self) -> &[u8];
-}
-
 macro_rules! impl_read_primitive {
     ($name:ident, $t:ty) => {
-        fn $name(&mut self, addr: &Address) -> Result<$t, Error> {
+        pub fn $name(&self, addr: &Address) -> Result<$t, Error> {
             let mut buf = [0u8; size_of::<$t>()];
             self.read(addr, &mut buf)?;
 
@@ -92,25 +77,177 @@ macro_rules! impl_read_primitive {
 
 macro_rules! impl_write_primitive {
     ($name:ident, $t:ty) => {
-        fn $name(&mut self, addr: &Address, value: $t) -> Result<(), Error> {
+        pub fn $name(&self, addr: &Address, value: $t) -> Result<(), Error> {
             let buf = value.to_be_bytes();
             self.write(addr, &buf)
         }
     };
 }
 
-pub trait Transceiver {
-    fn read(&mut self, addr: &Address, data: &mut [u8]) -> Result<(), Error>;
+enum DmaState<D: SpiDmaDevice> {
+    Pending,
+    Idle { dev: D, scratch_buffers: DmaBuffers },
+    InFlight(D::Transaction),
+}
 
-    fn write(&mut self, addr: &Address, data: &[u8]) -> Result<(), Error>;
+pub(crate) struct Transceiver<D: SpiDmaDevice> {
+    device: AtomicCell<DmaState<D>>,
+}
 
-    /// Bulk read via DMA (blocking for now): frames the header and moves the
-    /// payload through the [`SpiDma`] path into `dst`.
-    fn bulk_read(&mut self, addr: &Address, dst: &mut [u8]) -> Result<(), Error>;
+impl<D: SpiDmaDevice> Transceiver<D> {
+    pub fn new(dev: D, scratch_buffers: DmaBuffers) -> Self {
+        if scratch_buffers.rx.len() != scratch_buffers.tx.len() {
+            panic!("Scratch buffers should have the same length");
+        }
 
-    /// Bulk write via DMA (blocking for now): frames the header and moves `data`
-    /// through the [`SpiDma`] path.
-    fn bulk_write(&mut self, addr: &Address, data: &[u8]) -> Result<(), Error>;
+        Self {
+            device: AtomicCell::new(DmaState::Idle {
+                dev,
+                scratch_buffers,
+            }),
+        }
+    }
+
+    /// This is a sync method
+    pub fn transaction(&self, operations: &mut [Operation<'_, u8>]) -> Result<(), Error> {
+        let mut guard = self.device.lock_mut()?;
+        let mut cell = guard.as_mut();
+        let (dev, scratch_buffers) = {
+            let current_state = mem::replace(cell, DmaState::Pending);
+
+            match current_state {
+                DmaState::Pending | DmaState::InFlight(_) => {
+                    let _ = mem::replace(cell, current_state);
+                    return Err(nb::Error::WouldBlock);
+                }
+                DmaState::Idle {
+                    dev,
+                    scratch_buffers,
+                } => (dev, scratch_buffers),
+            }
+        };
+
+        let (dev, scratch_buffers, error) =
+            Self::exec_transaction(dev, scratch_buffers, operations);
+        let _ = mem::replace(
+            cell,
+            DmaState::Idle {
+                dev,
+                scratch_buffers,
+            },
+        );
+
+        match error {
+            Some(e) => Err(nb::Error::Other(e)),
+            None => Ok(()),
+        }
+    }
+
+    fn exec_transaction(
+        dev: D,
+        scratch_buffers: DmaBuffers,
+        operations: &mut [Operation<'_, u8>],
+    ) -> (D, DmaBuffers, Option<DriverError>) {
+        let mut index = 0;
+        let mut scratch_buffers = scratch_buffers;
+        let mut dev = dev;
+
+        while index < operations.len() {
+            let mut offset = 0;
+            let mut start_index = index;
+
+            while index < operations.len() {
+                match &operations[index] {
+                    Operation::Read(items) => {
+                        if offset + items.len() > scratch_buffers.rx.len() {
+                            break;
+                        }
+
+                        offset += items.len();
+                    }
+                    Operation::Write(items) | Operation::Transfer(_, items) => {
+                        if offset + items.len() > scratch_buffers.tx.len() {
+                            break;
+                        }
+
+                        scratch_buffers.tx[offset..offset + items.len()].copy_from_slice(items);
+                        offset += items.len();
+                    }
+                    Operation::TransferInPlace(items) => {
+                        if offset + items.len() > scratch_buffers.tx.len() {
+                            break;
+                        }
+
+                        scratch_buffers.tx[offset..offset + items.len()].copy_from_slice(items);
+                        offset += items.len();
+                    }
+
+                    Operation::DelayNs(ns) => break,
+                }
+
+                index += 1;
+            }
+
+            if start_index == index {
+                match operations[index] {
+                    Operation::DelayNs(ns) => {
+                        dev.delay_ns(ns);
+                        index += 1;
+                        continue;
+                    }
+
+                    _ => {
+                        return (
+                            dev,
+                            scratch_buffers,
+                            Some(DriverError::ScratchBufferOverrun),
+                        );
+                    }
+                }
+            }
+
+            scratch_buffers.len = offset;
+            match dev.transceive(scratch_buffers) {
+                Ok(transaction) => (dev, scratch_buffers) = transaction.wait(),
+                Err((_, dev, buffers)) => {
+                    return (dev, buffers, Some(DriverError::SpiError));
+                }
+            }
+
+            offset = 0;
+
+            while start_index < operations.len() {
+                match &mut operations[index] {
+                    Operation::Read(items)
+                    | Operation::Transfer(items, _)
+                    | Operation::TransferInPlace(items) => {
+                        items.copy_from_slice(&scratch_buffers.rx[offset..offset + items.len()]);
+                        offset += items.len();
+                    }
+
+                    Operation::Write(_) | Operation::DelayNs(_) => (),
+                }
+
+                start_index += 1;
+            }
+        }
+
+        (dev, scratch_buffers, None)
+    }
+
+    pub fn read(&self, addr: &Address, data: &mut [u8]) -> Result<(), Error> {
+        self.transaction(&mut [
+            Operation::Write(&create_header(addr, false)),
+            Operation::Read(data),
+        ])
+    }
+
+    pub fn write(&self, addr: &Address, data: &[u8]) -> Result<(), Error> {
+        self.transaction(&mut [
+            Operation::Write(&create_header(addr, true)),
+            Operation::Write(data),
+        ])
+    }
 
     impl_read_primitive!(read_u8, u8);
     impl_read_primitive!(read_u16, u16);

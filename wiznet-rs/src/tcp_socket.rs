@@ -1,5 +1,5 @@
 use crate::{
-    DriverError, Error,
+    DriverError, Error, SpiDmaDevice,
     atomic_cell::{AtomicCell, AtomicMutLock},
     ring_buffer::RingBuffer,
     socket::{SocketBackend, SocketProtocolMode, SocketStatus},
@@ -141,10 +141,10 @@ impl<'a> TcpSocketState<'a> {
     /// graceful FIN (`DISCON`) after one best-effort flush of staged tx data;
     /// for a socket still coming up it aborts with `CLOSE`. Either way we land
     /// in a closing state and the existing teardown machinery finishes the job.
-    fn handle_close<T: Transceiver>(
+    fn handle_close<D: SpiDmaDevice>(
         &mut self,
         block: &BlockAddress,
-        trans: &mut T,
+        trans: &Transceiver<D>,
     ) -> Result<(), Error> {
         self.close_requested = false;
 
@@ -185,10 +185,10 @@ impl<'a> TcpSocketState<'a> {
     /// Configure the hardware socket and issue `OPEN`. This is the first tick of
     /// a freshly opened (or re-armed) socket; the source port must be set before
     /// `OPEN`, and `CONNECT`/`LISTEN` are only valid once it reaches `SOCK_INIT`.
-    fn handle_init<T: Transceiver>(
+    fn handle_init<D: SpiDmaDevice>(
         &mut self,
         block: &BlockAddress,
-        trans: &mut T,
+        trans: &Transceiver<D>,
     ) -> Result<(), Error> {
         init_socket(block, trans, SocketProtocolMode::TCP4)?;
 
@@ -206,10 +206,10 @@ impl<'a> TcpSocketState<'a> {
 
     /// Waiting for the `OPEN` command to move the socket into `SOCK_INIT`,
     /// then issuing the protocol-specific command (`CONNECT`/`LISTEN`).
-    fn handle_opening<T: Transceiver>(
+    fn handle_opening<D: SpiDmaDevice>(
         &mut self,
         block: &BlockAddress,
-        trans: &mut T,
+        trans: &Transceiver<D>,
     ) -> Result<(), Error> {
         // `OPEN` not processed yet.
         if is_command_pending(block, trans)? {
@@ -249,10 +249,10 @@ impl<'a> TcpSocketState<'a> {
         }
     }
 
-    fn handle_connecting<T: Transceiver>(
+    fn handle_connecting<D: SpiDmaDevice>(
         &mut self,
         block: &BlockAddress,
-        trans: &mut T,
+        trans: &Transceiver<D>,
     ) -> Result<(), Error> {
         if is_command_pending(block, trans)? {
             return Ok(());
@@ -299,10 +299,10 @@ impl<'a> TcpSocketState<'a> {
     /// Passively waiting on a `LISTEN`ing socket for a client to connect. Once
     /// the handshake completes the socket is `SOCK_ESTABLISHED` and is handed
     /// off to the same established machinery as an outbound connection.
-    fn handle_listening<T: Transceiver>(
+    fn handle_listening<D: SpiDmaDevice>(
         &mut self,
         block: &BlockAddress,
-        trans: &mut T,
+        trans: &Transceiver<D>,
     ) -> Result<(), Error> {
         if is_command_pending(block, trans)? {
             return Ok(());
@@ -346,10 +346,10 @@ impl<'a> TcpSocketState<'a> {
     /// Returns the number of bytes still sitting in the chip's RX buffer after
     /// this pass (non-zero only when the local ring filled up). A return of `0`
     /// means the chip buffer is fully drained.
-    fn receive<T: Transceiver>(
+    fn receive<D: SpiDmaDevice>(
         &mut self,
         block: &BlockAddress,
-        trans: &mut T,
+        trans: &Transceiver<D>,
     ) -> Result<usize, Error> {
         let available = get_rx_received_size(block, trans)? as usize;
         if available == 0 {
@@ -393,10 +393,10 @@ impl<'a> TcpSocketState<'a> {
     /// Returns the number of bytes still queued in the local tx ring after this
     /// pass (non-zero only when the chip's TX buffer filled up). A return of `0`
     /// means everything staged has been handed to the chip.
-    fn transmit<T: Transceiver>(
+    fn transmit<D: SpiDmaDevice>(
         &mut self,
         block: &BlockAddress,
-        trans: &mut T,
+        trans: &Transceiver<D>,
     ) -> Result<usize, Error> {
         let pending = self.tx_buffer.len();
         if pending == 0 {
@@ -436,10 +436,10 @@ impl<'a> TcpSocketState<'a> {
     /// Idle health-check for an established connection: watch for the failure
     /// and teardown conditions that can occur while we are not actively
     /// sending or receiving.
-    fn handle_established<T: Transceiver>(
+    fn handle_established<D: SpiDmaDevice>(
         &mut self,
         block: &BlockAddress,
-        trans: &mut T,
+        trans: &Transceiver<D>,
     ) -> Result<(), Error> {
         let interrupts = get_interrupts(block, trans)?;
 
@@ -503,10 +503,10 @@ impl<'a> TcpSocketState<'a> {
         }
     }
 
-    fn handle_closing<T: Transceiver>(
+    fn handle_closing<D: SpiDmaDevice>(
         &mut self,
         block: &BlockAddress,
-        trans: &mut T,
+        trans: &Transceiver<D>,
     ) -> Result<(), Error> {
         if read_status(block, trans)? == SocketStatusRegister::Closed {
             self.status = match &self.status {
@@ -521,10 +521,10 @@ impl<'a> TcpSocketState<'a> {
     }
 
     /// Advance the state machine by one non-blocking tick.
-    pub(crate) fn run<T: Transceiver>(
+    pub(crate) fn run<D: SpiDmaDevice>(
         &mut self,
         block: &BlockAddress,
-        trans: &mut T,
+        trans: &Transceiver<D>,
     ) -> Result<(), Error> {
         self.store_error(|me| {
             if me.close_requested {

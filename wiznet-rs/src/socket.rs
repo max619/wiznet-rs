@@ -1,7 +1,7 @@
 use bitflags::bitflags;
 
 use crate::{
-    Error,
+    Error, SpiDmaDevice,
     socket_common::init_socket,
     tcp_socket::TcpSocketState,
     transiver::{BlockAddress, Transceiver},
@@ -107,7 +107,7 @@ impl<'a> SocketBackend<'a> {
 
     /// Drive whichever protocol state machine occupies this slot for one tick,
     /// then free the slot if a release was requested and teardown has finished.
-    pub(crate) fn run<T: Transceiver>(&mut self, trans: &mut T) -> Result<(), Error> {
+    pub(crate) fn run<D: SpiDmaDevice>(&mut self, trans: &Transceiver<D>) -> Result<(), Error> {
         let result = match &mut self.state {
             BackendState::Free => Ok(()),
             BackendState::Tcp(tcp) => tcp.run(&self.block, trans),
@@ -132,7 +132,7 @@ impl<'a> SocketBackend<'a> {
     /// Force the hardware socket back to CLOSED. A slot pending release is freed
     /// immediately (it is already closed on the chip); otherwise an occupied
     /// slot is re-armed so it re-opens on the next `run`.
-    pub(crate) fn reset<T: Transceiver>(&mut self, trans: &mut T) -> Result<(), Error> {
+    pub(crate) fn reset<D: SpiDmaDevice>(&mut self, trans: &Transceiver<D>) -> Result<(), Error> {
         init_socket(&self.block, trans, SocketProtocolMode::CLOSED)?;
 
         if self.release_requested {
