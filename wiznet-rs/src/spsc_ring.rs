@@ -68,6 +68,16 @@ impl<'a> SpscRing<'a> {
         self.cap.load(Ordering::Acquire)
     }
 
+    /// Discard all buffered bytes, returning the ring to empty without touching
+    /// the backing buffer. Safe only when no producer/consumer can run
+    /// concurrently — call from a control path (e.g. socket re-arm) while the
+    /// socket is not established, so neither `main` nor the servicing interrupt
+    /// is moving bytes through this ring.
+    pub(crate) fn clear(&self) {
+        self.head.store(0, Ordering::Relaxed);
+        self.tail.store(0, Ordering::Release);
+    }
+
     /// Bytes currently stored (available to read).
     pub(crate) fn len(&self) -> usize {
         let tail = self.tail.load(Ordering::Acquire);

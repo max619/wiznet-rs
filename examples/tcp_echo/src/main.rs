@@ -104,10 +104,10 @@ fn main() -> ! {
     let chip: &'static Chip =
         CHIP_CELL.init(W6100::new(hal_spi, rst, scratch, mac).expect("Failed to init W6100"));
 
-    // Periodic 1 ms tick: drives the non-interrupt transitions (handshake/close
+    // Periodic 100 ms tick: drives the non-interrupt transitions (handshake/close
     // polling, TX flush) and backstops any missed INT edge.
     let mut timer = dp.TIM2.counter_hz(&mut rcc);
-    timer.start(1000.Hz()).unwrap();
+    timer.start(10.Hz()).unwrap();
     timer.listen(Event::Update);
 
     // Publish the chip and the interrupt-owned peripherals, then let the ISRs run.

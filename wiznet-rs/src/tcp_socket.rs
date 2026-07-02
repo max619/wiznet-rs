@@ -604,6 +604,11 @@ impl<'a> TcpSocket<'a> {
 
         if let Some(tcp) = guard.as_mut().as_tcp_mut() {
             tcp.rearm();
+            // Drop any bytes left over from the previous connection so the
+            // reconnected session starts with empty rx/tx rings. Safe here: the
+            // socket is being re-armed (not established), so neither the ISR nor
+            // `main` is moving bytes through the rings.
+            self.socket.rings.clear();
         }
 
         Ok(())

@@ -89,6 +89,14 @@ impl<'a> SocketRings<'a> {
         self.rx.install(rx);
         self.tx.install(tx);
     }
+
+    /// Drop any buffered rx/tx bytes, returning both rings to empty. Called on
+    /// socket re-arm so a reconnected session starts with clean buffers rather
+    /// than data left over from the previous connection.
+    pub(crate) fn clear(&self) {
+        self.rx.clear();
+        self.tx.clear();
+    }
 }
 
 /// One of the chip's eight hardware sockets: the protocol state machine behind a
