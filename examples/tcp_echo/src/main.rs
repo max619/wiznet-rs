@@ -106,7 +106,7 @@ fn main() -> ! {
     // Periodic 1 ms tick: drives the non-interrupt transitions (handshake/close
     // polling, TX flush) and backstops any missed INT edge.
     let mut timer = dp.TIM2.counter_hz(&mut rcc);
-    timer.start(1.kHz()).unwrap();
+    timer.start(100.Hz()).unwrap();
     timer.listen(Event::Update);
 
     // Publish the chip and the interrupt-owned peripherals, then let the ISRs run.
@@ -171,7 +171,7 @@ fn main() -> ! {
         // room for, so we must retry the remainder instead of dropping it —
         // dropping here is what silently truncated/corrupted the echoed stream.
         // We refill `buf` only once the previous chunk is completely echoed.
-        let mut buf = [0u8; 16];
+        let mut buf = [0u8; 128];
         let mut len = 0usize; // bytes staged in `buf`
         let mut off = 0usize; // bytes of `buf[..len]` already written out
 
@@ -182,14 +182,24 @@ fn main() -> ! {
                 Ok(SocketStatus::Established) => {
                     led.set_low(); // LED on while connected (active low)
 
-                    // Pull the next chunk only when the previous one is drained,
-                    // so nothing already read is ever lost to a full tx ring.
-                    if off == len {
-                        len = sock.read(&mut buf).unwrap_or(0);
-                        off = 0;
-                    }
-                    if off < len {
-                        off += sock.write(&buf[off..len]).unwrap_or(0);
+                    // Drain as much as possible each wake so the RX pipeline
+                    // can't back up: refill `buf` from the rx ring only once the
+                    // previous chunk is fully echoed (so nothing read is ever lost
+                    // to a full tx ring), and keep going until the rx ring is empty
+                    // or the tx ring is full.
+                    loop {
+                        if off == len {
+                            len = sock.read(&mut buf).unwrap_or(0);
+                            off = 0;
+                            if len == 0 {
+                                break; // rx ring drained
+                            }
+                        }
+                        let n = sock.write(&buf[off..len]).unwrap_or(0);
+                        off += n;
+                        if n == 0 {
+                            break; // tx ring full — resume next wake
+                        }
                     }
                 }
 

@@ -559,41 +559,33 @@ struct EchoCfg {
 }
 
 impl EchoCfg {
-    /// Lossless, sequential — isolates transport framing/pointer correctness.
-    fn transport(chunk: usize) -> Self {
+    fn new(chunk: usize, interleave: bool, app: AppLoop) -> Self {
         Self {
             chunk,
-            interleave: false,
-            app: AppLoop::Lossless,
+            interleave,
+            app,
         }
+    }
+
+    /// Lossless, sequential — isolates transport framing/pointer correctness.
+    fn transport(chunk: usize) -> Self {
+        Self::new(chunk, false, AppLoop::Lossless)
     }
 
     /// Lossless, but `main` runs during the in-flight DMA — exercises the SPSC
     /// ring handshake across the (simulated) interrupt boundary.
     fn concurrent(chunk: usize) -> Self {
-        Self {
-            chunk,
-            interleave: true,
-            app: AppLoop::Lossless,
-        }
+        Self::new(chunk, true, AppLoop::Lossless)
     }
 
     /// The current (fixed) firmware echo loop, concurrent.
     fn firmware(chunk: usize) -> Self {
-        Self {
-            chunk,
-            interleave: true,
-            app: AppLoop::FirmwareCarry,
-        }
+        Self::new(chunk, true, AppLoop::FirmwareCarry)
     }
 
     /// The old drop-on-full firmware loop, concurrent — the `out.txt` bug.
     fn dropping(chunk: usize) -> Self {
-        Self {
-            chunk,
-            interleave: true,
-            app: AppLoop::DropOnFull,
-        }
+        Self::new(chunk, true, AppLoop::DropOnFull)
     }
 }
 
@@ -679,6 +671,7 @@ fn echo_firmware_loop_roundtrips() {
     let input = include_bytes!("../../CLAUDE.md");
     assert_echo(input, &run_echo(input, EchoCfg::firmware(128)));
 }
+
 
 /// Root-cause guard. The *old* firmware loop did `let _ = sock.write(..)`,
 /// ignoring how many bytes the tx ring accepted and dropping the rest. Under a

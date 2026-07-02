@@ -1,5 +1,8 @@
+# `--chip` is the 128K CB variant so probe-rs accepts the larger unoptimized debug
+# image (see memory.x). It is pin/peripheral identical to the C8; revert to
+# STM32F103C8Tx if you restore the 64K flash region.
 [target.thumbv7m-none-eabi]
-runner = 'probe-rs run --connect-under-reset --chip STM32F103C8Tx'
+runner = 'probe-rs run --connect-under-reset --chip STM32F103CBTx'
 rustflags = [
   "-C", "link-arg=-Tlink.x",
   #"-C", "link-arg=-Tdefmt.x",

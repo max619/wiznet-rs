@@ -11,10 +11,11 @@
             "name": "Debug example: spi_dma_loopback",
             "cwd": "${workspaceFolder}",
             "connectUnderReset": true,
-            "chip": "STM32F103C8Tx",
+            "chip": "STM32F103CBTx",
             "flashingConfig": {
                 "flashingEnabled": true,
-                "haltAfterReset": true
+                "haltAfterReset": true,
+                "verifyAfterFlashing": true
             },
             "coreConfigs": [
                 {
@@ -30,10 +31,11 @@
             "name": "probe-rs Test: tcp_echo",
             "cwd": "${workspaceFolder}",
             "connectUnderReset": false,
-            "chip": "STM32F103C8Tx",
+            "chip": "STM32F103CBTx",
             "flashingConfig": {
                 "flashingEnabled": true,
-                "haltAfterReset": true
+                "haltAfterReset": true,
+                "verifyAfterFlashing": true
             },
             "coreConfigs": [
                 {

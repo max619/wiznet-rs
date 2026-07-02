@@ -2,7 +2,9 @@
 resolver = "3"
 members = ["wiznet-rs", "examples/tcp_echo"]
 
-# Your own crate: unoptimized, full debug info — fully debuggable.
+# Your own crates: light optimization, full debug info — the default debuggable
+# split. (The `opt-level = 0` package overrides below drop the app + driver to
+# fully unoptimized for source-level stepping; keep this at 1 for everything else.)
 [profile.dev]
 opt-level = 1
 debug = true
@@ -13,3 +15,14 @@ debug = true
 [profile.dev.package."*"]
 opt-level = "z"
 debug = false
+
+# The app + driver: fully unoptimized with full debug info so every local and
+# argument is inspectable and single-stepping matches the source. The size cost
+# stays bounded because the HAL/cortex-m deps above are still built at `"z"`.
+[profile.dev.package.tcp_echo]
+opt-level = 0
+debug = true
+
+[profile.dev.package.wiznet-rs]
+opt-level = 0
+debug = true

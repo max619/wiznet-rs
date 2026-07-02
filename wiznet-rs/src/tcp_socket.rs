@@ -1,9 +1,7 @@
 use crate::{
     DriverError, Error, SpiDmaDevice,
     atomic_cell::AtomicMutLock,
-    socket::{
-        BulkAction, BulkKind, Socket, SocketProtocolMode, SocketRings, SocketStatus,
-    },
+    socket::{BulkAction, BulkKind, Socket, SocketProtocolMode, SocketRings, SocketStatus},
     socket_common::{
         SocketCommand, SocketInterrupt, SocketStatusRegister, clear_interrupts, get_interrupts,
         get_rx_read_pointer, get_rx_received_size, get_tx_free_size, get_tx_write_pointer,
@@ -451,14 +449,22 @@ impl TcpSocketState {
             // chip (the consumer may still drain the local ring afterwards).
             SocketStatusRegister::CloseWait => match self.receive(block, trans, rings)? {
                 action @ BulkAction::Started { .. } => Ok(action),
-                BulkAction::None => {
-                    if get_rx_received_size(block, trans)? == 0 {
-                        send_sock_command(block, trans, SocketCommand::Disconnect)?;
-                        self.status = SocketStatus::Closing;
-                    }
 
-                    Ok(BulkAction::None)
-                }
+                // In case we cant transmit on close wait, meybe there is something to recieve
+                BulkAction::None => match self.transmit(block, trans, rings)? {
+                    action @ BulkAction::Started { .. } => Ok(action),
+                    BulkAction::None => {
+                        if rings.tx.len() == 0
+                            && rings.rx.len() == 0
+                            && get_rx_received_size(block, trans)? == 0
+                        {
+                            send_sock_command(block, trans, SocketCommand::Disconnect)?;
+                            self.status = SocketStatus::Closing;
+                        }
+
+                        Ok(BulkAction::None)
+                    }
+                },
             },
 
             // Connection already fully torn down.
@@ -504,20 +510,21 @@ impl TcpSocketState {
         rings: &SocketRings,
     ) -> Result<BulkAction, Error> {
         let result = if self.close_requested {
-            self.handle_close(block, trans, rings).map(|()| BulkAction::None)
+            self.handle_close(block, trans, rings)
+                .map(|()| BulkAction::None)
         } else {
             match self.status {
                 SocketStatus::Init => self.handle_init(block, trans).map(|()| BulkAction::None),
                 SocketStatus::Opening => {
                     self.handle_opening(block, trans).map(|()| BulkAction::None)
                 }
-                SocketStatus::Connecting => {
-                    self.handle_connecting(block, trans).map(|()| BulkAction::None)
-                }
+                SocketStatus::Connecting => self
+                    .handle_connecting(block, trans)
+                    .map(|()| BulkAction::None),
                 SocketStatus::Established => self.handle_established(block, trans, rings),
-                SocketStatus::Listening => {
-                    self.handle_listening(block, trans).map(|()| BulkAction::None)
-                }
+                SocketStatus::Listening => self
+                    .handle_listening(block, trans)
+                    .map(|()| BulkAction::None),
                 SocketStatus::ClosingDueToError
                 | SocketStatus::ClosingDueToTimeout
                 | SocketStatus::Closing => {

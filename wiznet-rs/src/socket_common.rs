@@ -288,13 +288,22 @@ pub(crate) fn init_socket<D: SpiDmaDevice>(
         0xFF,
     )?;
 
-    // Enable all interrupts
+    // Enable only the interrupts the driver acts on. SENDOK is deliberately left
+    // masked: the driver never reads it, and because it stays asserted after every
+    // SEND completes (nothing clears it) it would hold the shared INT line low for
+    // the whole session — killing the falling-edge EXTI wake path and forcing all
+    // servicing onto the timer tick. Masking it keeps INT free to signal RECV/CON/
+    // DISCON/TIMEOUT edges.
+    let enabled = SocketInterrupt::CON
+        | SocketInterrupt::DISCON
+        | SocketInterrupt::RECV
+        | SocketInterrupt::TIMEOUT;
     trans.write_u8(
         &Address {
             address: SN_IMR,
             block: block.reg,
         },
-        0xFF,
+        enabled.bits(),
     )?;
 
     Ok(())

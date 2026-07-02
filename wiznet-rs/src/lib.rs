@@ -21,8 +21,8 @@ mod transiver;
 use self::transiver::{Address, BlockAddress, BlockSelectionBits, Transceiver};
 
 mod socket;
-use self::socket::{BulkAction, BulkKind, Socket, SocketBackend, SocketRings};
 pub use self::socket::SocketStatus;
+use self::socket::{BulkAction, BulkKind, Socket, SocketBackend, SocketRings};
 
 mod socket_common;
 use self::socket_common::{
@@ -298,7 +298,11 @@ impl<'a, Spi: SpiDmaDevice, RstPin: OutputPin> W6100<'a, Spi, RstPin> {
         }
 
         for socket in self.sockets.iter() {
-            socket.backend.lock_mut()?.as_mut().reset(&device.transport)?;
+            socket
+                .backend
+                .lock_mut()?
+                .as_mut()
+                .reset(&device.transport)?;
         }
 
         // Unlock SYSR registers
@@ -533,11 +537,7 @@ impl<'a, Spi: SpiDmaDevice, RstPin: OutputPin> W6100<'a, Spi, RstPin> {
     /// payload (read) and commit the chip-side pointers + command. Runs only the
     /// small synchronous epilogue ops over the bus; the bulk payload already
     /// moved by DMA.
-    fn finish_bulk(
-        op: BulkOp,
-        trans: &Transceiver<Spi>,
-        rings: &SocketRings,
-    ) -> Result<(), Error> {
+    fn finish_bulk(op: BulkOp, trans: &Transceiver<Spi>, rings: &SocketRings) -> Result<(), Error> {
         let end = op.pointer.wrapping_add(op.len as u16);
 
         match op.kind {
