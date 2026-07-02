@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Driver host unit tests. The workspace default target is thumbv7m-none-eabi
+  # (see .cargo/config.toml), so the platform-independent tests must be run with
+  # an explicit host --target override, matching the command in CLAUDE.md.
+  host-tests:
+    name: Host tests (wiznet-rs)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run driver unit tests on the host
+        run: cargo test -p wiznet-rs --target x86_64-unknown-linux-gnu
+
+  # Firmware build for the STM32F103. Only compilation is checked here — there is
+  # no hardware in CI to flash and exercise the echo server.
+  echo-build:
+    name: Build echo firmware
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: thumbv7m-none-eabi
+      - uses: Swatinem/rust-cache@v2
+      - name: Build echo example (debug)
+        run: cargo build -p echo
+      - name: Build echo example (release)
+        run: cargo build -p echo --release
+
+  # Guard the hard layer boundary: the driver crate must stay platform-independent
+  # and never import the STM32 HAL (see CLAUDE.md).
+  driver-independence:
+    name: Driver platform-independence
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Ensure wiznet-rs does not import stm32f1xx-hal
+        run: |
+          if grep -rn stm32f1xx_hal wiznet-rs/src/; then
+            echo "::error::wiznet-rs must not depend on stm32f1xx-hal"
+            exit 1
+          fi
