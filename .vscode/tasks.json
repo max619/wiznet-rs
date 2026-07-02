@@ -10,10 +10,10 @@
             "group": "build"
         },
         {
-            "label": "cargo build example: tcp_echo",
+            "label": "cargo build example: echo",
             "type": "shell",
             "command": "cargo",
-            "args": ["build", "-p", "tcp_echo"],
+            "args": ["build", "-p", "echo"],
             "problemMatcher": ["$rustc"],
             "group": "build"
         }

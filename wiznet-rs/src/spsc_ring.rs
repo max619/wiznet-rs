@@ -35,6 +35,15 @@ pub(crate) struct SpscRing<'a> {
     head: AtomicUsize,
     /// Producer index — bytes put in so far.
     tail: AtomicUsize,
+    /// Datagram-framing sidechannel (used only by the UDP path; the TCP
+    /// byte-stream ignores it). Counts *complete* frames the producer has fully
+    /// written into the byte ring. The producer bumps `frames_in` **after** all
+    /// of a frame's bytes are committed, so a consumer that gates on
+    /// `frames() > 0` never observes a half-written datagram — the byte
+    /// `head`/`tail` alone can't express that boundary. Free-running like
+    /// `head`/`tail`: live count is `frames_in - frames_out`.
+    frames_in: AtomicUsize,
+    frames_out: AtomicUsize,
     _marker: PhantomData<&'a mut [u8]>,
 }
 
@@ -47,6 +56,8 @@ impl<'a> SpscRing<'a> {
             cap: AtomicUsize::new(0),
             head: AtomicUsize::new(0),
             tail: AtomicUsize::new(0),
+            frames_in: AtomicUsize::new(0),
+            frames_out: AtomicUsize::new(0),
             _marker: PhantomData,
         }
     }
@@ -57,6 +68,8 @@ impl<'a> SpscRing<'a> {
         let len = buf.len();
         self.head.store(0, Ordering::Relaxed);
         self.tail.store(0, Ordering::Relaxed);
+        self.frames_in.store(0, Ordering::Relaxed);
+        self.frames_out.store(0, Ordering::Relaxed);
         self.ptr.store(buf.as_mut_ptr(), Ordering::Relaxed);
         // Publish capacity last: a non-zero `cap` is the signal that the buffer
         // (stored above) is ready, so it carries `Release` to order those writes
@@ -75,6 +88,8 @@ impl<'a> SpscRing<'a> {
     /// is moving bytes through this ring.
     pub(crate) fn clear(&self) {
         self.head.store(0, Ordering::Relaxed);
+        self.frames_out.store(0, Ordering::Relaxed);
+        self.frames_in.store(0, Ordering::Relaxed);
         self.tail.store(0, Ordering::Release);
     }
 
@@ -157,6 +172,64 @@ impl<'a> SpscRing<'a> {
 
         self.head.store(head.wrapping_add(n), Ordering::Release);
         n
+    }
+
+    /// Consumer: copy up to `dst.len()` stored bytes out **without** advancing
+    /// `head`, returning the number copied. Lets the datagram path inspect a
+    /// frame's length header before committing to consume the whole frame (so a
+    /// datagram that doesn't fit the chip's TX buffer this tick is left staged).
+    pub(crate) fn peek(&self, dst: &mut [u8]) -> usize {
+        let cap = self.capacity();
+        if cap == 0 {
+            return 0;
+        }
+
+        let tail = self.tail.load(Ordering::Acquire);
+        let head = self.head.load(Ordering::Relaxed);
+        let n = core::cmp::min(dst.len(), tail.wrapping_sub(head));
+        if n == 0 {
+            return 0;
+        }
+
+        let ptr = self.ptr.load(Ordering::Relaxed);
+        let start = head % cap;
+        let first = core::cmp::min(n, cap - start);
+
+        #[allow(unsafe_code)]
+        // SAFETY: identical to `read` (same backing, same published-bytes
+        // window), but `head` is left untouched so the bytes stay in the ring.
+        unsafe {
+            core::ptr::copy_nonoverlapping(ptr.add(start), dst.as_mut_ptr(), first);
+            if n > first {
+                core::ptr::copy_nonoverlapping(ptr, dst.as_mut_ptr().add(first), n - first);
+            }
+        }
+
+        n
+    }
+
+    /// Number of complete datagram frames currently available to the consumer.
+    /// See the `frames_in`/`frames_out` field docs for the ordering contract.
+    pub(crate) fn frames(&self) -> usize {
+        let produced = self.frames_in.load(Ordering::Acquire);
+        let consumed = self.frames_out.load(Ordering::Acquire);
+        produced.wrapping_sub(consumed)
+    }
+
+    /// Producer: publish one datagram frame. Call **after** every byte of the
+    /// frame has been `write`n so the `Release` here orders those bytes ahead of
+    /// the consumer observing the frame via [`frames`](Self::frames).
+    pub(crate) fn commit_frame(&self) {
+        let produced = self.frames_in.load(Ordering::Relaxed);
+        self.frames_in.store(produced.wrapping_add(1), Ordering::Release);
+    }
+
+    /// Consumer: retire one datagram frame after its bytes have been `read`
+    /// (or `peek`ed then `read`) out of the ring.
+    pub(crate) fn release_frame(&self) {
+        let consumed = self.frames_out.load(Ordering::Relaxed);
+        self.frames_out
+            .store(consumed.wrapping_add(1), Ordering::Release);
     }
 }
 
@@ -272,5 +345,56 @@ mod tests {
             assert_eq!(b, next_read, "bytes must come out in the order written");
             next_read = next_read.wrapping_add(1);
         }
+    }
+
+    #[test]
+    fn peek_does_not_consume() {
+        let r = ring(8);
+        r.write(&[1, 2, 3, 4]);
+
+        let mut a = [0u8; 2];
+        assert_eq!(r.peek(&mut a), 2);
+        assert_eq!(a, [1, 2]);
+        assert_eq!(r.len(), 4, "peek leaves the bytes in place");
+
+        // A following read still sees the peeked bytes.
+        let mut b = [0u8; 4];
+        assert_eq!(r.read(&mut b), 4);
+        assert_eq!(b, [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn frame_counter_tracks_complete_datagrams() {
+        let r = ring(16);
+        assert_eq!(r.frames(), 0);
+
+        // Two framed datagrams pushed as raw bytes + a boundary commit each.
+        r.write(&[0xAA, 0xBB]);
+        r.commit_frame();
+        r.write(&[0xCC]);
+        r.commit_frame();
+        assert_eq!(r.frames(), 2);
+
+        // Consuming a frame's bytes and retiring it drops the count.
+        let mut out = [0u8; 2];
+        assert_eq!(r.read(&mut out), 2);
+        r.release_frame();
+        assert_eq!(r.frames(), 1);
+
+        assert_eq!(r.read(&mut out[..1]), 1);
+        r.release_frame();
+        assert_eq!(r.frames(), 0);
+    }
+
+    #[test]
+    fn clear_resets_frame_counters() {
+        let r = ring(8);
+        r.write(&[1, 2, 3]);
+        r.commit_frame();
+        assert_eq!(r.frames(), 1);
+
+        r.clear();
+        assert_eq!(r.frames(), 0);
+        assert_eq!(r.len(), 0);
     }
 }

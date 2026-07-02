@@ -9,10 +9,10 @@ A Cargo **workspace** with two members:
 - **`wiznet-rs/`** — a platform-independent, `no_std` Rust driver for WIZnet
   hardwired TCP/IP + Ethernet controllers (W6100 today; see `README.MD`), with
   DMA-based SPI transport and (in progress) async transfers.
-- **`examples/tcp_echo/`** — bare-metal firmware (`no_std`/`no_main`) for an
+- **`examples/echo/`** — bare-metal firmware (`no_std`/`no_main`) for an
   **STM32F103C8** ("blue pill", 64K flash / 20K RAM) that uses the driver to run
-  a TCP echo server on port 5555 over a W6100 attached via SPI. This is the
-  app/BSP layer.
+  a TCP echo server on port 5555 and a UDP echo server on port 5556 over a W6100
+  attached via SPI. This is the app/BSP layer.
 
 `examples/spi_dma_loopback.rs` is a standalone (non-member) SPI+DMA self-test;
 it isn't built by the workspace.
@@ -23,7 +23,7 @@ The target (`thumbv7m-none-eabi`) and linker are set in `.cargo/config.toml`, so
 
 - **Build everything:** `cargo build` (debug) / `cargo build --release`
 - **Build just the driver:** `cargo build -p wiznet-rs`
-- **Flash & run on hardware:** `cargo run -p tcp_echo` — uses the `probe-rs`
+- **Flash & run on hardware:** `cargo run -p echo` — uses the `probe-rs`
   runner (`--connect-under-reset --chip STM32F103C8Tx`); needs an attached SVD
   probe (e.g. ST-Link). VS Code launch config: `.vscode/launch.json`.
 - **Verify the driver stays platform-independent:**
@@ -51,7 +51,7 @@ Don't "fix" this — it's a deliberate size/debuggability split.
   `stm32f1xx-hal`.** It depends only on `embedded-hal` traits plus its own
   `SpiDmaDevice`/`SpiDmaTransaction` traits (`spi_dma.rs`). Keep it that way —
   the boundary is the whole point.
-- **`examples/tcp_echo/src/hal_spi.rs` + `main.rs` — the app/BSP.** All
+- **`examples/echo/src/hal_spi.rs` + `main.rs` — the app/BSP.** All
   `stm32f1xx-hal`, DMA, GPIO, and interrupt wiring lives here. `HalSpi` is the
   concrete SPI/DMA transport handed to the driver.
 
@@ -130,7 +130,7 @@ new variant, no trait objects.
   once the IRQ fires). `wait()` hands the device **and** buffers back.
   Deliberately knows nothing of W6100 (`Address`, block bits, reset are all
   driver/GPIO concepts that stay above it).
-- `HalSpi` (`examples/tcp_echo/src/hal_spi.rs`) — concrete impl over the HAL's
+- `HalSpi` (`examples/echo/src/hal_spi.rs`) — concrete impl over the HAL's
   `Spi1RxTxDma::read_write`. Holds only the DMA SPI, the CS pin, and the clock;
   it manages CS across a transfer (assert in `transceive`, release in `wait`).
   The `'static` scratch lives in the driver, not here. `RxWindow`/`TxWindow`

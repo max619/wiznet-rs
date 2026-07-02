@@ -32,10 +32,10 @@
             ]
         },
         {
-            "preLaunchTask": "cargo build example: tcp_echo",
+            "preLaunchTask": "cargo build example: echo",
             "type": "probe-rs-debug",
             "request": "launch",
-            "name": "probe-rs Test: tcp_echo",
+            "name": "probe-rs Test: echo",
             "cwd": "${workspaceFolder}",
             "connectUnderReset": false,
             "chip": "STM32F103CBTx",
@@ -47,7 +47,7 @@
             "coreConfigs": [
                 {
                     "coreIndex": 0,
-                    "programBinary": "${workspaceFolder}/target/thumbv7m-none-eabi/debug/tcp_echo"
+                    "programBinary": "${workspaceFolder}/target/thumbv7m-none-eabi/debug/echo"
                 }
             ]
         }

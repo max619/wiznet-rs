@@ -87,6 +87,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "790eea4361631c5e7d22598ecd5723ff611904e3344ce8720784c93e3d83d40b"
 
 [[package]]
+name = "echo"
+version = "0.1.0"
+dependencies = [
+ "bitflags 2.13.0",
+ "cortex-m",
+ "cortex-m-rt",
+ "embedded-dma",
+ "embedded-hal 1.0.0",
+ "embedded-hal-bus",
+ "nb 1.1.0",
+ "panic-halt",
+ "static_cell",
+ "stm32f1xx-hal",
+ "wiznet-rs",
+]
+
+[[package]]
 name = "embedded-can"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -331,23 +348,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
-]
-
-[[package]]
-name = "tcp_echo"
-version = "0.1.0"
-dependencies = [
- "bitflags 2.13.0",
- "cortex-m",
- "cortex-m-rt",
- "embedded-dma",
- "embedded-hal 1.0.0",
- "embedded-hal-bus",
- "nb 1.1.0",
- "panic-halt",
- "static_cell",
- "stm32f1xx-hal",
- "wiznet-rs",
 ]
 
 [[package]]

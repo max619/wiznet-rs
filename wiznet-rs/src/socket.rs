@@ -7,6 +7,7 @@ use crate::{
     spsc_ring::SpscRing,
     tcp_socket::TcpSocketState,
     transiver::{BlockAddress, Transceiver},
+    udp_socket::UdpSocketState,
 };
 
 bitflags! {
@@ -50,7 +51,14 @@ pub enum SocketStatus {
 /// DMA-complete interrupt.
 #[derive(Clone, Copy)]
 pub(crate) enum BulkKind {
+    /// TCP stream receive: captured bytes go straight into the rx ring.
     Receive,
+    /// UDP datagram receive: the chip's per-packet header was already read
+    /// synchronously, so its peer address rides along here. On completion a
+    /// local frame header (`[len | src_ip | src_port]`) is prepended to the
+    /// captured payload in the rx ring and the frame is committed.
+    ReceiveDatagram { src_ip: u32, src_port: u16 },
+    /// TX buffer write (TCP or UDP): finish commits the write pointer + `SEND`.
     Transmit,
 }
 
@@ -115,6 +123,7 @@ pub(crate) struct Socket<'a> {
 pub(crate) enum BackendState {
     Free,
     Tcp(TcpSocketState),
+    Udp(UdpSocketState),
 }
 
 /// The protocol state for one hardware socket. Owned by the `W6100`; user-facing
@@ -158,9 +167,27 @@ impl SocketBackend {
         true
     }
 
+    /// Claim a free slot for a UDP socket. Returns `false` if already in use.
+    pub(crate) fn claim_udp(&mut self, udp: UdpSocketState) -> bool {
+        if !self.is_free() {
+            return false;
+        }
+
+        self.state = BackendState::Udp(udp);
+        self.release_requested = false;
+        true
+    }
+
     pub(crate) fn as_tcp_mut(&mut self) -> Option<&mut TcpSocketState> {
         match &mut self.state {
             BackendState::Tcp(tcp) => Some(tcp),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn as_udp_mut(&mut self) -> Option<&mut UdpSocketState> {
+        match &mut self.state {
+            BackendState::Udp(udp) => Some(udp),
             _ => None,
         }
     }
@@ -170,8 +197,10 @@ impl SocketBackend {
     pub(crate) fn request_release(&mut self) {
         self.release_requested = true;
 
-        if let BackendState::Tcp(tcp) = &mut self.state {
-            tcp.request_close();
+        match &mut self.state {
+            BackendState::Tcp(tcp) => tcp.request_close(),
+            BackendState::Udp(udp) => udp.request_close(),
+            BackendState::Free => (),
         }
     }
 
@@ -185,6 +214,7 @@ impl SocketBackend {
         let result = match &mut self.state {
             BackendState::Free => Ok(BulkAction::None),
             BackendState::Tcp(tcp) => tcp.run(&self.block, trans, rings),
+            BackendState::Udp(udp) => udp.run(&self.block, trans, rings),
         };
 
         if self.release_requested && self.is_terminal() {
@@ -200,6 +230,7 @@ impl SocketBackend {
         match &self.state {
             BackendState::Free => true,
             BackendState::Tcp(tcp) => tcp.is_closed(),
+            BackendState::Udp(udp) => udp.is_closed(),
         }
     }
 
@@ -212,8 +243,12 @@ impl SocketBackend {
         if self.release_requested {
             self.state = BackendState::Free;
             self.release_requested = false;
-        } else if let BackendState::Tcp(tcp) = &mut self.state {
-            tcp.rearm();
+        } else {
+            match &mut self.state {
+                BackendState::Tcp(tcp) => tcp.rearm(),
+                BackendState::Udp(udp) => udp.rearm(),
+                BackendState::Free => (),
+            }
         }
 
         Ok(())

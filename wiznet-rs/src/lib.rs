@@ -36,6 +36,10 @@ mod tcp_socket;
 pub use self::tcp_socket::TcpSocket;
 use self::tcp_socket::TcpSocketState;
 
+mod udp_socket;
+pub use self::udp_socket::{SocketAddr, UdpSocket};
+use self::udp_socket::UdpSocketState;
+
 const CIDR: Address = Address {
     address: 0x0,
     block: BlockSelectionBits::CommonRegister,
@@ -423,6 +427,35 @@ impl<'a, Spi: SpiDmaDevice, RstPin: OutputPin> W6100<'a, Spi, RstPin> {
         Err(Error::WouldBlock)
     }
 
+    /// Open a UDP socket bound to `src_port`. Allocates a free hardware socket
+    /// and stages the buffers; the chip `OPEN` happens on the next `run`. UDP is
+    /// connectionless — the returned handle sends and receives datagrams to/from
+    /// any peer via [`send_to`](UdpSocket::send_to) /
+    /// [`recv_from`](UdpSocket::recv_from).
+    pub fn open_udp(
+        &'a self,
+        src_port: u16,
+        rx: &'a mut [u8],
+        tx: &'a mut [u8],
+    ) -> Result<UdpSocket<'a>, Error> {
+        for socket in self.sockets.iter() {
+            let mut guard = match socket.backend.lock_mut() {
+                Ok(guard) => guard,
+                Err(_) => continue,
+            };
+
+            if guard.as_mut().is_free() {
+                socket.rings.install(rx, tx);
+                guard.as_mut().claim_udp(UdpSocketState::bind(src_port));
+                drop(guard);
+
+                return Ok(UdpSocket::new(socket));
+            }
+        }
+
+        Err(Error::WouldBlock)
+    }
+
     pub fn run(&self) -> Result<(), Error> {
         let mut dev_guard = self.device.lock_mut()?;
         let device = dev_guard.as_mut();
@@ -558,6 +591,27 @@ impl<'a, Spi: SpiDmaDevice, RstPin: OutputPin> W6100<'a, Spi, RstPin> {
                     rings.rx.write(payload);
                 })?;
 
+                set_rx_read_pointer(&op.block, trans, end)?;
+                send_sock_command(&op.block, trans, SocketCommand::Receive)?;
+                clear_interrupts(&op.block, trans, SocketInterrupt::RECV)?;
+            }
+            BulkKind::ReceiveDatagram { src_ip, src_port } => {
+                // Prepend the local frame header, then the captured payload, and
+                // publish the datagram as one frame. The rx `free` room for both
+                // was checked before the transfer started, so both writes fit.
+                let mut header = [0u8; 8];
+                header[0..2].copy_from_slice(&(op.len as u16).to_be_bytes());
+                header[2..6].copy_from_slice(&src_ip.to_be_bytes());
+                header[6..8].copy_from_slice(&src_port.to_be_bytes());
+                rings.rx.write(&header);
+
+                trans.finish_read(op.len, |payload| {
+                    rings.rx.write(payload);
+                })?;
+                rings.rx.commit_frame();
+
+                // `op.pointer` is the payload start (past the chip's PACKINFO
+                // header), so `end` already accounts for the whole packet.
                 set_rx_read_pointer(&op.block, trans, end)?;
                 send_sock_command(&op.block, trans, SocketCommand::Receive)?;
                 clear_interrupts(&op.block, trans, SocketInterrupt::RECV)?;

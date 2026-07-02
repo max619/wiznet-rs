@@ -21,7 +21,7 @@ use stm32f1xx_hal::{
 mod hal_spi;
 
 use crate::hal_spi::{HalSpi, SCRATCH};
-use wiznet_rs::{DmaBuffers, NetworkConfig, SocketStatus, TcpSocket, W6100};
+use wiznet_rs::{DmaBuffers, NetworkConfig, SocketAddr, SocketStatus, TcpSocket, UdpSocket, W6100};
 
 // Concrete types of the fully-configured chip, needed to name the `'static`
 // singleton storage and the interrupt-shared globals.
@@ -88,6 +88,8 @@ fn main() -> ! {
     static CHIP_CELL: StaticCell<Chip> = StaticCell::new();
     static RX: StaticCell<[u8; 512]> = StaticCell::new();
     static TX: StaticCell<[u8; 512]> = StaticCell::new();
+    static UDP_RX: StaticCell<[u8; 512]> = StaticCell::new();
+    static UDP_TX: StaticCell<[u8; 512]> = StaticCell::new();
     static RX_SCRATCH: StaticCell<[u8; SCRATCH]> = StaticCell::new();
     static TX_SCRATCH: StaticCell<[u8; SCRATCH]> = StaticCell::new();
 
@@ -130,8 +132,10 @@ fn main() -> ! {
     // return `Err(Busy)` if an ISR is mid-servicing the socket — just retry.
     //
     // The 'static buffers can only be handed out once, so the listener is opened
-    // on the first link-up and re-armed (not re-created) on later ones.
+    // on the first link-up and re-armed (not re-created) on later ones. The UDP
+    // echo socket (port 5556) follows the same open-once / re-arm rule.
     let mut socket: Option<TcpSocket<'static>> = None;
+    let mut udp: Option<UdpSocket<'static>> = None;
 
     loop {
         // Phase 1: wait for the link to really come up (per the cached link
@@ -165,7 +169,29 @@ fn main() -> ! {
                 .expect("Failed to re-arm socket");
         }
 
+        // UDP echo on port 5556: bounce every datagram back to its sender. Same
+        // open-once / re-arm lifecycle as the TCP listener.
+        if udp.is_none() {
+            udp = Some(
+                chip.open_udp(5556, UDP_RX.init([0u8; 512]), UDP_TX.init([0u8; 512]))
+                    .expect("Failed to open udp socket"),
+            );
+        } else {
+            udp.as_ref()
+                .unwrap()
+                .reconnect()
+                .expect("Failed to re-arm udp socket");
+        }
+
         let sock = socket.as_ref().unwrap();
+        let udp_sock = udp.as_ref().unwrap();
+
+        // Staging for the UDP echo. `udp_buf` holds one datagram's payload;
+        // `udp_pending` marks it as read-but-not-yet-accepted by the tx ring
+        // (send_to is all-or-nothing for a datagram) so a momentarily full ring
+        // makes us retry it rather than drop it.
+        let mut udp_buf = [0u8; 512];
+        let mut udp_pending: Option<(usize, SocketAddr)> = None;
 
         // Echo carry-over: bytes read from the rx ring that have not yet been
         // fully accepted by the tx ring. `write` only takes what the ring has
@@ -216,6 +242,29 @@ fn main() -> ! {
                 }
 
                 _ => led.set_high(), // off (listening/connecting/busy)
+            }
+
+            // UDP echo: bounce every datagram back to its sender. Flush any
+            // carried-over datagram first, then keep draining the rx side until
+            // it is empty or the tx ring fills (carry the unsent one for the
+            // next wake so nothing is dropped).
+            loop {
+                if let Some((n, peer)) = udp_pending {
+                    if udp_sock.send_to(&udp_buf[..n], peer).unwrap_or(0) == 0 {
+                        break; // tx ring still full — resume next wake
+                    }
+                    udp_pending = None;
+                }
+
+                match udp_sock.recv_from(&mut udp_buf) {
+                    Ok(Some((n, peer))) => {
+                        if udp_sock.send_to(&udp_buf[..n], peer).unwrap_or(0) == 0 {
+                            udp_pending = Some((n, peer)); // retry next wake
+                            break;
+                        }
+                    }
+                    _ => break, // nothing waiting
+                }
             }
 
             cortex_m::asm::wfi();

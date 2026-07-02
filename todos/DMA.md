@@ -4,7 +4,7 @@
 
 - [x] **Restructure into a workspace.** The driver moved out of the firmware's
       `src/w6100/` into its own crate **`wiznet-rs/`**; the firmware is now the
-      **`examples/tcp_echo/`** member (`main.rs` + `hal_spi.rs`). The boundary is
+      **`examples/echo/`** member (`main.rs` + `hal_spi.rs`). The boundary is
       enforced the same way: `grep -rn stm32f1xx_hal wiznet-rs/src/` is empty.
 - [x] **Transport trait redesign.** The old `SpiDevice` + `SpiDma`
       (`start_read`/`start_write`/`finish`/`read_buffer`) pair is **gone**.
@@ -33,7 +33,7 @@
       that fits, and copies results back. `DmaState { Idle, InFlight, Pending }`
       is the seam for async (see Phase 2).
 - [x] **Phase 1 correctness** — bulk transfers go through the HAL's
-      `Spi1RxTxDma::read_write` full-duplex DMA (`examples/tcp_echo/src/hal_spi.rs`),
+      `Spi1RxTxDma::read_write` full-duplex DMA (`examples/echo/src/hal_spi.rs`),
       all SPI (register ops included) routed through it. **Root-caused & fixed:**
       the early-return / truncated-read bug was a **stale RX transfer-complete
       flag**. `Transfer::wait()` for `RxTxDma` keys "done" off the RX channel's
@@ -134,7 +134,7 @@ within the same lock. Phase 2 splits that across calls using `DmaState`:
   no-ops by `run`).
 - **Abort on link-down:** `reset` must tear down an in-flight transfer (`wait()`
   + drop the pending op) so nothing hangs.
-- **Interrupt + init (`examples/tcp_echo/src/main.rs`):** add `#[interrupt] fn
+- **Interrupt + init (`examples/echo/src/main.rs`):** add `#[interrupt] fn
   DMA1_CHANNEL2()` → cached chip → `chip.dma_complete()`; enable the RX-channel
   TC interrupt + `NVIC::unmask`. Chip alias is
   `W6100<'static, HalSpi, Pin<'A', 8, Output>>`.
@@ -159,7 +159,7 @@ These cost real debugging time — keep them in mind for all DMA work:
   always moves `N` bytes (the buffer's array length), not a sub-length. To send
   exactly `len` bytes, wrap the `'static` slice in a type whose `ReadBuffer`/
   `WriteBuffer` reports `len` (the `RxWindow`/`TxWindow` wrappers in
-  `examples/tcp_echo/src/hal_spi.rs`). Getting this wrong clocks garbage past the
+  `examples/echo/src/hal_spi.rs`). Getting this wrong clocks garbage past the
   intended frame (corrupts W6100 writes).
 - **SPI clock:** loopback-verified clean at **16 MHz** on this board (not just
   the 1 MHz it is set to) — the size bump in `## Out of scope` is proven safe.

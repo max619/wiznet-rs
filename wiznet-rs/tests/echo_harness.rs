@@ -3,7 +3,7 @@
 //! This drives the **real** `W6100` driver through its public API against a
 //! software model of the W6100 chip that sits behind the `SpiDmaDevice` trait —
 //! the exact seam the firmware's `HalSpi` plugs into. It reproduces, on the host,
-//! the full echo data path that `examples/tcp_echo` runs on hardware:
+//! the full echo data path that `examples/echo` runs on hardware:
 //!
 //!   client bytes -> chip RX buffer -> [async DMA] -> rx ring -> echo ->
 //!   tx ring -> [async DMA] -> chip TX buffer -> "sent" output
@@ -34,7 +34,8 @@ use embedded_hal::digital::{ErrorType, OutputPin};
 use embedded_hal::spi::ErrorKind;
 
 use wiznet_rs::{
-    Completion, DmaBuffers, NetworkConfig, SocketStatus, SpiDmaDevice, SpiDmaTransaction, W6100,
+    Completion, DmaBuffers, NetworkConfig, SocketAddr, SocketStatus, SpiDmaDevice,
+    SpiDmaTransaction, W6100,
 };
 
 // ---------------------------------------------------------------------------
@@ -62,17 +63,23 @@ const SN_CR: u16 = 0x0010;
 const SN_IR: u16 = 0x0020;
 const SN_IRCLR: u16 = 0x0028;
 const SN_SR: u16 = 0x0030;
+const SN_DIPR: u16 = 0x0120; // destination IPv4 (UDP send-to)
+const SN_DPORTR: u16 = 0x0140; // destination port (UDP send-to)
 const SN_TX_FSR: u16 = 0x0204;
 const SN_TX_WR: u16 = 0x020C;
 const SN_RX_RSR: u16 = 0x0224;
 const SN_RX_RD: u16 = 0x0228;
 const SN_RX_WR: u16 = 0x022C;
 
+// Socket mode-register values (low nibble).
+const MR_UDP4: u8 = 0x02;
+
 // Socket status-register values.
 const SR_CLOSED: u8 = 0x00;
 const SR_INIT: u8 = 0x13;
 const SR_LISTEN: u8 = 0x14;
 const SR_ESTABLISHED: u8 = 0x17;
+const SR_UDP: u8 = 0x22;
 
 // Socket commands.
 const CMD_OPEN: u8 = 0x01;
@@ -145,19 +152,26 @@ impl ChipBuffer {
 }
 
 struct SocketModel {
+    mr: u8,
     sr: u8,
     ir: u8,
     rx: ChipBuffer,
     tx: ChipBuffer,
+    /// Destination programmed for the next UDP SEND (Sn_DIPR/Sn_DPORTR).
+    dst_ip: u32,
+    dst_port: u16,
 }
 
 impl SocketModel {
     fn new() -> Self {
         Self {
+            mr: 0,
             sr: SR_CLOSED,
             ir: 0,
             rx: ChipBuffer::new(),
             tx: ChipBuffer::new(),
+            dst_ip: 0,
+            dst_port: 0,
         }
     }
 }
@@ -168,6 +182,9 @@ struct ChipState {
     sockets: Vec<SocketModel>,
     /// Bytes the chip has SENT, per socket — the echo output under test.
     sent: Vec<Vec<u8>>,
+    /// One entry per UDP SEND: `(dst_ip, dst_port, payload)`. Lets the datagram
+    /// test assert each reply went back to the right peer, boundaries intact.
+    sent_dgrams: Vec<Vec<(u32, u16, Vec<u8>)>>,
 }
 
 impl ChipState {
@@ -175,6 +192,7 @@ impl ChipState {
         ChipState {
             sockets: (0..8).map(|_| SocketModel::new()).collect(),
             sent: (0..8).map(|_| Vec::new()).collect(),
+            sent_dgrams: (0..8).map(|_| Vec::new()).collect(),
         }
     }
 
@@ -183,7 +201,14 @@ impl ChipState {
     /// (reads back 0), so the driver's `is_command_pending` sees it as done.
     fn run_command(&mut self, sock: usize, cmd: u8) {
         match cmd {
-            CMD_OPEN => self.sockets[sock].sr = SR_INIT,
+            // In UDP mode OPEN lands in SOCK_UDP; TCP OPEN lands in SOCK_INIT.
+            CMD_OPEN => {
+                self.sockets[sock].sr = if self.sockets[sock].mr & 0x0F == MR_UDP4 {
+                    SR_UDP
+                } else {
+                    SR_INIT
+                }
+            }
             CMD_LISTEN => self.sockets[sock].sr = SR_LISTEN,
             CMD_CLOSE | CMD_DISCONNECT => self.sockets[sock].sr = SR_CLOSED,
             CMD_SEND => {
@@ -195,6 +220,13 @@ impl ChipState {
                 tx.peek(tx.read_ptr, &mut out);
                 tx.read_ptr = tx.write_ptr;
                 self.sent[sock].extend_from_slice(&out);
+
+                // UDP: each SEND is one datagram to the programmed destination.
+                if self.sockets[sock].mr & 0x0F == MR_UDP4 {
+                    let dst_ip = self.sockets[sock].dst_ip;
+                    let dst_port = self.sockets[sock].dst_port;
+                    self.sent_dgrams[sock].push((dst_ip, dst_port, out));
+                }
             }
             CMD_RECV => { /* RX_RD already written; RSR is derived live. */ }
             _ => {}
@@ -227,9 +259,11 @@ impl ChipState {
             v = (v << 8) | b as u32;
         }
         match addr {
-            SN_MR => {}
+            SN_MR => self.sockets[sock].mr = v as u8,
             SN_CR => self.run_command(sock, v as u8),
             SN_IRCLR => self.sockets[sock].ir &= !(v as u8),
+            SN_DIPR => self.sockets[sock].dst_ip = v,
+            SN_DPORTR => self.sockets[sock].dst_port = v as u16,
             SN_TX_WR => self.sockets[sock].tx.write_ptr = v as u16,
             SN_RX_RD => self.sockets[sock].rx.read_ptr = v as u16,
             _ => {}
@@ -372,6 +406,33 @@ fn echoed_len(chip: &Rc<RefCell<ChipState>>, sock: usize) -> usize {
     chip.borrow().sent[sock].len()
 }
 
+/// Simulate a peer sending one UDP datagram into the socket's RX FIFO: the chip
+/// prepends its 8-byte UDP4 PACKINFO header (`[flags:5|len:11 (2 bytes) | ip(4)
+/// | port(2)]`) ahead of the payload, exactly as recv-side hardware does.
+/// Bounded by free space; returns true if the whole datagram was accepted.
+fn peer_send_udp(chip: &Rc<RefCell<ChipState>>, sock: usize, peer: SocketAddr, data: &[u8]) -> bool {
+    let mut c = chip.borrow_mut();
+    let need = 8 + data.len();
+    if (c.sockets[sock].rx.free() as usize) < need {
+        return false;
+    }
+
+    // flags = 0 (UDP/IPv4, unicast); low 11 bits carry the length.
+    let info_len = (data.len() as u16) & 0x07FF;
+    let mut packinfo = [0u8; 8];
+    packinfo[0..2].copy_from_slice(&info_len.to_be_bytes());
+    packinfo[2..6].copy_from_slice(&peer.ip.to_be_bytes());
+    packinfo[6..8].copy_from_slice(&peer.port.to_be_bytes());
+
+    let wr = c.sockets[sock].rx.write_ptr;
+    c.sockets[sock].rx.poke(wr, &packinfo);
+    let wr = wr.wrapping_add(8);
+    c.sockets[sock].rx.poke(wr, data);
+    c.sockets[sock].rx.write_ptr = wr.wrapping_add(data.len() as u16);
+    c.sockets[sock].ir |= IR_RECV;
+    true
+}
+
 // ---------------------------------------------------------------------------
 // The harness driver.
 // ---------------------------------------------------------------------------
@@ -429,7 +490,7 @@ fn run_echo(input: &[u8], cfg: EchoCfg) -> Vec<u8> {
     // The `main`-thread echo step: read up to 16 bytes (exactly as the firmware
     // does) and write them back. Two modes:
     //   - faithful: `let _ = write(..)`, dropping whatever the tx ring rejects —
-    //     bit-for-bit the firmware's `examples/tcp_echo` loop.
+    //     bit-for-bit the firmware's `examples/echo` loop.
     //   - lossless: carry the remainder in `pending` so an app-level short write
     //     never drops data, isolating *transport* correctness from app backpressure.
     // Per-run echo state. `Lossless` uses `pending`; `FirmwareCarry` uses the
@@ -540,7 +601,7 @@ enum AppLoop {
     /// unbounded buffer. Drops nothing; isolates *transport* correctness.
     Lossless,
     /// The current firmware loop: a bounded 16-byte staging buffer, refilled only
-    /// once fully echoed, retrying short writes (`examples/tcp_echo/src/main.rs`).
+    /// once fully echoed, retrying short writes (`examples/echo/src/main.rs`).
     /// Also lossless, but with the exact bounded-carry logic the firmware uses.
     FirmwareCarry,
     /// The old firmware bug: read up to 16 bytes and `let _ = write(..)`, dropping
@@ -673,6 +734,182 @@ fn echo_firmware_loop_roundtrips() {
 }
 
 
+// --- UDP: datagram framing + peer address round-trip ----------------------
+
+/// End-to-end UDP echo through the real driver: a set of datagrams from several
+/// peers must come back out, each as its own SEND, boundaries intact, addressed
+/// to the peer that sent it. Exercises the PACKINFO parse, ring framing, and the
+/// `recv_from`/`send_to` handle path.
+#[test]
+fn udp_echo_datagrams_roundtrip() {
+    let chip = Rc::new(RefCell::new(ChipState::new()));
+    let spi = MockSpi { chip: chip.clone() };
+
+    let scratch = DmaBuffers {
+        rx: leak(HEADER + 512),
+        tx: leak(HEADER + 512),
+        len: 0,
+    };
+    let mac = [0xfc, 0xd7, 0xfd, 0xab, 0x8b, 0xe4];
+    let w6100 = W6100::new(spi, MockRstPin, scratch, mac).expect("chip init");
+
+    w6100
+        .set_network_config(NetworkConfig {
+            ip: u32::from_be_bytes([192, 168, 10, 10]),
+            gateway: u32::from_be_bytes([192, 168, 10, 1]),
+            subnet: u32::from_be_bytes([255, 255, 255, 0]),
+        })
+        .unwrap();
+    let sock = w6100.open_udp(5556, leak(512), leak(512)).expect("open udp");
+
+    // Bring the socket up (OPEN -> SOCK_UDP == Established).
+    for _ in 0..50 {
+        let _ = w6100.service();
+        w6100.dma_complete();
+        if matches!(sock.status(), Ok(SocketStatus::Established)) {
+            break;
+        }
+    }
+    assert!(
+        matches!(sock.status(), Ok(SocketStatus::Established)),
+        "udp socket never opened"
+    );
+
+    // The datagrams to echo: distinct peers, distinct lengths (incl. a wrap of
+    // the counting pattern and an empty datagram).
+    let peers = [
+        SocketAddr { ip: u32::from_be_bytes([192, 168, 10, 20]), port: 40000 },
+        SocketAddr { ip: u32::from_be_bytes([10, 0, 0, 5]), port: 5000 },
+        SocketAddr { ip: u32::from_be_bytes([192, 168, 10, 20]), port: 40001 },
+        SocketAddr { ip: u32::from_be_bytes([8, 8, 4, 4]), port: 1234 },
+    ];
+    let payloads: Vec<Vec<u8>> = vec![
+        b"hello udp".to_vec(),
+        (0..300u32).map(|i| (i % 251) as u8).collect(),
+        Vec::new(), // empty datagram is valid
+        b"the quick brown fox".to_vec(),
+    ];
+    let expected: Vec<(SocketAddr, Vec<u8>)> = peers
+        .iter()
+        .zip(payloads.iter())
+        .map(|(p, d)| (*p, d.clone()))
+        .collect();
+
+    let mut next_feed = 0usize;
+    let mut buf = [0u8; 512];
+
+    // Convergence loop: feed the next datagram when the rx FIFO has room, run one
+    // background step, echo whatever the ring has, and finish the DMA. Stop once
+    // every datagram has been sent back.
+    let mut iters = 0;
+    loop {
+        iters += 1;
+        assert!(iters < 100_000, "udp echo did not converge");
+
+        if next_feed < expected.len() {
+            let (peer, data) = &expected[next_feed];
+            if peer_send_udp(&chip, 0, *peer, data) {
+                next_feed += 1;
+            }
+        }
+
+        let _ = w6100.service();
+        // App echo: bounce one datagram back to its sender.
+        if let Ok(Some((n, peer))) = sock.recv_from(&mut buf) {
+            let _ = sock.send_to(&buf[..n], peer);
+        }
+        w6100.dma_complete();
+
+        if chip.borrow().sent_dgrams[0].len() >= expected.len() {
+            // One more drain pass to flush any in-flight SEND.
+            let _ = w6100.service();
+            w6100.dma_complete();
+            break;
+        }
+    }
+
+    let got = chip.borrow().sent_dgrams[0].clone();
+    assert_eq!(
+        got.len(),
+        expected.len(),
+        "wrong number of datagrams echoed"
+    );
+    for (i, ((exp_peer, exp_data), (ip, port, data))) in expected.iter().zip(got.iter()).enumerate()
+    {
+        assert_eq!(*ip, exp_peer.ip, "datagram {i}: wrong dest ip");
+        assert_eq!(*port, exp_peer.port, "datagram {i}: wrong dest port");
+        assert_eq!(data, exp_data, "datagram {i}: payload corrupted");
+    }
+}
+
+/// A datagram too large to ever fit the rx ring must be dropped on the chip, not
+/// left to wedge the RX buffer. A normal datagram queued behind it must still get
+/// through — proving the oversized one was skipped, not stalled on.
+#[test]
+fn udp_oversized_datagram_dropped() {
+    let chip = Rc::new(RefCell::new(ChipState::new()));
+    let spi = MockSpi { chip: chip.clone() };
+    let scratch = DmaBuffers {
+        rx: leak(HEADER + 512),
+        tx: leak(HEADER + 512),
+        len: 0,
+    };
+    let mac = [0xfc, 0xd7, 0xfd, 0xab, 0x8b, 0xe4];
+    let w6100 = W6100::new(spi, MockRstPin, scratch, mac).expect("chip init");
+    w6100
+        .set_network_config(NetworkConfig {
+            ip: u32::from_be_bytes([192, 168, 10, 10]),
+            gateway: u32::from_be_bytes([192, 168, 10, 1]),
+            subnet: u32::from_be_bytes([255, 255, 255, 0]),
+        })
+        .unwrap();
+    // 512-byte rings: a 600-byte datagram can never be framed (needs 608).
+    let sock = w6100.open_udp(5556, leak(512), leak(512)).expect("open udp");
+    for _ in 0..50 {
+        let _ = w6100.service();
+        w6100.dma_complete();
+        if matches!(sock.status(), Ok(SocketStatus::Established)) {
+            break;
+        }
+    }
+
+    let big_peer = SocketAddr { ip: u32::from_be_bytes([10, 0, 0, 1]), port: 1111 };
+    let ok_peer = SocketAddr { ip: u32::from_be_bytes([10, 0, 0, 2]), port: 2222 };
+    let oversized: Vec<u8> = (0..600).map(|i| (i % 251) as u8).collect();
+    let ok_payload = b"fits fine".to_vec();
+
+    assert!(peer_send_udp(&chip, 0, big_peer, &oversized));
+    assert!(peer_send_udp(&chip, 0, ok_peer, &ok_payload));
+
+    let mut buf = [0u8; 512];
+    for _ in 0..2000 {
+        let _ = w6100.service();
+        if let Ok(Some((n, peer))) = sock.recv_from(&mut buf) {
+            let _ = sock.send_to(&buf[..n], peer);
+        }
+        w6100.dma_complete();
+        if !chip.borrow().sent_dgrams[0].is_empty() {
+            let _ = w6100.service();
+            w6100.dma_complete();
+            break;
+        }
+    }
+
+    let got = chip.borrow().sent_dgrams[0].clone();
+    assert_eq!(got.len(), 1, "exactly the fitting datagram should be echoed");
+    assert_eq!(got[0].0, ok_peer.ip, "wrong dest ip — oversized wasn't dropped");
+    assert_eq!(got[0].1, ok_peer.port, "wrong dest port");
+    assert_eq!(&got[0].2, &ok_payload, "payload corrupted");
+
+    // The chip's RX buffer must be fully drained: both datagrams consumed off
+    // the chip (the oversized one skipped, the small one delivered).
+    assert_eq!(
+        chip.borrow().sockets[0].rx.used(),
+        0,
+        "rx buffer wedged — oversized datagram was not skipped"
+    );
+}
+
 /// Root-cause guard. The *old* firmware loop did `let _ = sock.write(..)`,
 /// ignoring how many bytes the tx ring accepted and dropping the rest. Under a
 /// fast sender the driver keeps *receiving* (it prioritizes RX over TX in
@@ -690,6 +927,6 @@ fn drop_on_full_corrupts_stream() {
         input.as_slice(),
         got.as_slice(),
         "dropping on a full tx ring must lose data — this is the out.txt bug the \
-         bounded-carry fix in examples/tcp_echo/src/main.rs prevents"
+         bounded-carry fix in examples/echo/src/main.rs prevents"
     );
 }

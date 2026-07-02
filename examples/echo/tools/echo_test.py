@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Host-side integrity + throughput test for the tcp_echo firmware.
+"""Host-side integrity + throughput test for the echo firmware.
 
 The STM32F103 + W6100 firmware runs a TCP echo server on 192.168.10.10:5555
-(see examples/tcp_echo/src/main.rs). This tool connects, streams data, and
+(see examples/echo/src/main.rs). This tool connects, streams data, and
 verifies every echoed byte matches what was sent, in order, while measuring
 round-trip throughput.
 
