@@ -42,7 +42,7 @@ fn main() -> ! {
 
     let mut flash = dp.FLASH.constrain();
     let mut rcc = dp.RCC.freeze(
-        rcc::Config::hse(8.MHz()).sysclk(16.MHz()).pclk1(24.MHz()),
+        rcc::Config::hse(8.MHz()).sysclk(24.MHz()).pclk1(24.MHz()),
         &mut flash.acr,
     );
 
@@ -107,7 +107,7 @@ fn main() -> ! {
     // Periodic 1 ms tick: drives the non-interrupt transitions (handshake/close
     // polling, TX flush) and backstops any missed INT edge.
     let mut timer = dp.TIM2.counter_hz(&mut rcc);
-    timer.start(100.Hz()).unwrap();
+    timer.start(1000.Hz()).unwrap();
     timer.listen(Event::Update);
 
     // Publish the chip and the interrupt-owned peripherals, then let the ISRs run.
