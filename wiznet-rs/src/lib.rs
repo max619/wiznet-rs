@@ -270,6 +270,8 @@ impl<'a, Spi: SpiDmaDevice, RstPin: OutputPin> W6100<'a, Spi, RstPin> {
     }
 
     pub fn reset(&self) -> Result<(), Error> {
+        const MAX_RESET_WAIT_ITERATIONS: usize = 100;
+
         let mut dev_guard = self.device.lock_mut()?;
         let device = dev_guard.as_mut();
 
@@ -289,8 +291,18 @@ impl<'a, Spi: SpiDmaDevice, RstPin: OutputPin> W6100<'a, Spi, RstPin> {
 
         device.rst.set_high().map_err(|_| Error::Other(PinError))?;
 
-        if device.transport.read_u16(&CIDR)? != 0x6100 {
-            return Err(Error::Other(DriverError::UnexpectedResponse));
+        let mut init_wait_counter = 0;
+        while device.transport.read_u16(&CIDR)? != 0x6100 {
+            if init_wait_counter >= MAX_RESET_WAIT_ITERATIONS {
+                return Err(Error::Other(DriverError::UnexpectedResponse));
+            }
+
+            device
+                .transport
+                .transaction(&mut [Operation::DelayNs(1_000_000)])
+                .map_err(|_| Error::Other(SpiError))?;
+
+            init_wait_counter += 1;
         }
 
         if device.transport.read_u16(&VER)? != 0x4661 {

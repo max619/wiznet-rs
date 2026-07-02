@@ -9,6 +9,7 @@ use cortex_m::peripheral::NVIC;
 use cortex_m_rt::entry;
 use panic_halt as _;
 use static_cell::StaticCell;
+use stm32f1xx_hal::gpio::Floating;
 use stm32f1xx_hal::{
     gpio::{Edge, ExtiPin, Input, Output, Pin, PullUp},
     pac::{self, interrupt},
@@ -32,7 +33,7 @@ type Chip = W6100<'static, HalSpi, ChipRst>;
 // INT pin are owned so the ISRs can clear their pending flags.
 static CHIP: Mutex<Cell<Option<&'static Chip>>> = Mutex::new(Cell::new(None));
 static TIMER: Mutex<RefCell<Option<CounterHz<pac::TIM2>>>> = Mutex::new(RefCell::new(None));
-static INT_PIN: Mutex<RefCell<Option<Pin<'A', 10, Input<PullUp>>>>> =
+static INT_PIN: Mutex<RefCell<Option<Pin<'A', 10, Input<Floating>>>>> =
     Mutex::new(RefCell::new(None));
 
 #[entry]
@@ -59,7 +60,7 @@ fn main() -> ! {
     let cs: Pin<'A', 9, Output> = gpio_a.pa9.into_push_pull_output(&mut gpio_a.crh);
 
     // W6100 INT line (active low) -> EXTI line 10, falling edge.
-    let mut int_pin = gpio_a.pa10.into_pull_up_input(&mut gpio_a.crh);
+    let mut int_pin = gpio_a.pa10.into_floating_input(&mut gpio_a.crh);
     int_pin.make_interrupt_source(&mut afio);
     int_pin.trigger_on_edge(&mut exti, Edge::Falling);
     int_pin.enable_interrupt(&mut exti);

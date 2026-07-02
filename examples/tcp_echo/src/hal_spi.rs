@@ -68,7 +68,7 @@ impl HalSpi {
 impl DelayNs for HalSpi {
     fn delay_ns(&mut self, ns: u32) {
         let cycles = ((ns as u64 * self.sysclk_hz as u64) / 1_000_000_000) as u32;
-        cortex_m::asm::delay(cycles.max(1));
+        cortex_m::asm::delay(cycles);
     }
 }
 
@@ -153,11 +153,7 @@ impl SpiDmaTransaction<HalSpi> for HalTransaction {
         dma.rxchannel.unlisten(Event::TransferComplete);
 
         (
-            HalSpi {
-                dma,
-                cs,
-                sysclk_hz,
-            },
+            HalSpi { dma, cs, sysclk_hz },
             DmaBuffers {
                 rx: rx_win.buf,
                 tx: tx_win.buf,
