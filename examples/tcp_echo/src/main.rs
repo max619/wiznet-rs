@@ -166,6 +166,15 @@ fn main() -> ! {
 
         let sock = socket.as_ref().unwrap();
 
+        // Echo carry-over: bytes read from the rx ring that have not yet been
+        // fully accepted by the tx ring. `write` only takes what the ring has
+        // room for, so we must retry the remainder instead of dropping it —
+        // dropping here is what silently truncated/corrupted the echoed stream.
+        // We refill `buf` only once the previous chunk is completely echoed.
+        let mut buf = [0u8; 16];
+        let mut len = 0usize; // bytes staged in `buf`
+        let mut off = 0usize; // bytes of `buf[..len]` already written out
+
         // Phase 3: handle the connection until the link drops, then loop back to
         // phase 1 and wait for it to return.
         while chip.link_up() {
@@ -173,11 +182,14 @@ fn main() -> ! {
                 Ok(SocketStatus::Established) => {
                     led.set_low(); // LED on while connected (active low)
 
-                    let mut buf = [0u8; 16];
-                    if let Ok(n) = sock.read(&mut buf) {
-                        if n > 0 {
-                            let _ = sock.write(&buf[..n]);
-                        }
+                    // Pull the next chunk only when the previous one is drained,
+                    // so nothing already read is ever lost to a full tx ring.
+                    if off == len {
+                        len = sock.read(&mut buf).unwrap_or(0);
+                        off = 0;
+                    }
+                    if off < len {
+                        off += sock.write(&buf[off..len]).unwrap_or(0);
                     }
                 }
 
@@ -185,6 +197,10 @@ fn main() -> ! {
                 // the next connection.
                 Ok(SocketStatus::Closed) | Ok(SocketStatus::Timeout) | Ok(SocketStatus::Error) => {
                     led.set_high(); // off
+                    // Drop any half-echoed carry-over from the old connection so
+                    // it can't bleed into the next client.
+                    len = 0;
+                    off = 0;
                     let _ = sock.reconnect();
                 }
 
